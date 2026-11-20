@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
+import shutil
+from contextlib import suppress
 from pathlib import Path
 
 import yaml
@@ -24,32 +25,48 @@ def skill_md(name: str, description: str, lines: list[str]) -> str:
     return f"---\nname: {name}\ndescription: {description}\n---\n{body}"
 
 
-def _tree_files(directory: Path) -> list[tuple[str, Path]]:
-    files = []
-    for path in directory.rglob("*"):
-        rel = path.relative_to(directory)
-        if "__pycache__" in rel.parts or path.suffix == ".pyc" or not path.is_file():
-            continue
-        files.append((rel.as_posix(), path))
-    return sorted(files)
+_RUNTIME_CACHE_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
 
 
-def _tree_hash(directory: Path, algo: str) -> str:
-    digest = hashlib.new(algo)
-    for rel, path in _tree_files(directory):
-        digest.update(rel.encode("utf-8"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+def _is_runtime_cache(path: Path, skill_dir: Path) -> bool:
+    """Mirror of Hermes tools/skills_sync_optional.py _is_runtime_cache."""
+    relative = path.relative_to(skill_dir)
+    if any(part in _RUNTIME_CACHE_DIRS for part in relative.parts[:-1]):
+        return True
+    if path.name in _RUNTIME_CACHE_DIRS and path.is_dir():
+        return True
+    return path.suffix in {".pyc", ".pyo"} and path.with_suffix(".py").is_file()
 
 
 def dir_hash_md5(directory: Path) -> str:
-    """Local copy of Hermes' bundled skill dir hash (MD5 over sorted relpath + bytes)."""
-    return _tree_hash(Path(directory), "md5")
+    """Mirror of Hermes tools/skills_sync.py dir_hash (the .bundled_manifest hash).
+
+    MD5 over relpath str + bytes in Path sort order, skipping runtime caches.
+    """
+    directory = Path(directory)
+    hasher = hashlib.md5()
+    with suppress(OSError):
+        for fpath in sorted(directory.rglob("*")):
+            if not _is_runtime_cache(fpath, directory) and fpath.is_file():
+                hasher.update(str(fpath.relative_to(directory)).encode("utf-8"))
+                hasher.update(fpath.read_bytes())
+    return hasher.hexdigest()
 
 
-def dir_hash_sha256(directory: Path) -> str:
-    """Same walk as dir_hash_md5 but SHA-256, used for hub lock content hashes."""
-    return _tree_hash(Path(directory), "sha256")
+def _content_digest(skill_path: Path) -> str:
+    """Mirror of Hermes tools/skills_guard.py _content_digest for a skill directory."""
+    h = hashlib.sha256()
+    for rel, p in sorted(
+        (p.relative_to(skill_path).as_posix(), p) for p in skill_path.rglob("*") if p.is_file()
+    ):
+        h.update(rel.encode("utf-8") + b"\x00")
+        h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def hub_content_hash(path: Path) -> str:
+    """Mirror of Hermes tools/skills_guard.py content_hash (the .hub/lock.json content_hash)."""
+    return f"sha256:{_content_digest(Path(path))[:16]}"
 
 
 def write_files(directory: Path, files: dict[str, str | bytes]) -> None:
@@ -59,7 +76,7 @@ def write_files(directory: Path, files: dict[str, str | bytes]) -> None:
         if isinstance(content, bytes):
             target.write_bytes(content)
         else:
-            target.write_text(content)
+            target.write_text(content, encoding="utf-8")
 
 
 def profile_home(root: Path, profile: str) -> Path:
@@ -77,27 +94,32 @@ def _make_symlink(root: Path, link: Path, target_spec: str) -> None:
     link.symlink_to(target, target_is_directory=True)
 
 
-def _write_bundled_manifest(skills: Path, origins: dict[str, dict[str, str | bytes]]) -> None:
+def _write_bundled_manifest(
+    root: Path, profile: str, skills: Path, origins: dict[str, dict[str, str | bytes]]
+) -> None:
     lines = []
     for name, files in origins.items():
-        with tempfile.TemporaryDirectory() as tmp:
-            write_files(Path(tmp), files)
-            lines.append(f"{name}:{dir_hash_md5(Path(tmp))}")
-    (skills / ".bundled_manifest").write_text("".join(f"{line}\n" for line in lines))
+        origin = root / "_origin" / profile / name
+        if origin.exists():
+            shutil.rmtree(origin)
+        write_files(origin, files)
+        lines.append(f"{name}:{dir_hash_md5(origin)}")
+        shutil.rmtree(origin)
+    (skills / ".bundled_manifest").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
 
 def _write_hub_lock(skills: Path, installs: dict[str, str]) -> None:
     installed = {
         name: {
             "install_path": rel,
-            "content_hash": "sha256:" + dir_hash_sha256(skills / rel),
+            "content_hash": hub_content_hash(skills / rel),
             "source": "test",
         }
         for name, rel in installs.items()
     }
     lock = skills / ".hub" / "lock.json"
     lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text(json.dumps({"version": 1, "installed": installed}, indent=2))
+    lock.write_text(json.dumps({"version": 1, "installed": installed}, indent=2), encoding="utf-8")
 
 
 def make_fleet(root: Path, spec: dict) -> Path:
@@ -109,16 +131,20 @@ def make_fleet(root: Path, spec: dict) -> Path:
     for name in set(profiles) | set(bundled) | set(hub):
         home = profile_home(root, name)
         (home / "skills").mkdir(parents=True, exist_ok=True)
-        (home / "config.yaml").write_text(yaml.safe_dump(_EMPTY_CONFIG, sort_keys=False))
+        (home / "config.yaml").write_text(yaml.safe_dump(_EMPTY_CONFIG, sort_keys=False), encoding="utf-8")
     for name, skills_spec in profiles.items():
         skills = profile_home(root, name) / "skills"
         for rel, entry in skills_spec.items():
-            if isinstance(entry, str) and entry.startswith(SYMLINK_PREFIX):
+            if isinstance(entry, str):
+                if not entry.startswith(SYMLINK_PREFIX):
+                    raise ValueError(
+                        f"skill entry {name}:{rel} is a string but does not start with {SYMLINK_PREFIX!r}: {entry!r}"
+                    )
                 _make_symlink(root, skills / rel, entry[len(SYMLINK_PREFIX) :])
             else:
                 write_files(skills / rel, entry)
     for name, origins in bundled.items():
-        _write_bundled_manifest(profile_home(root, name) / "skills", origins)
+        _write_bundled_manifest(root, name, profile_home(root, name) / "skills", origins)
     for name, installs in hub.items():
         _write_hub_lock(profile_home(root, name) / "skills", installs)
     return root

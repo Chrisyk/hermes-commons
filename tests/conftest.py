@@ -9,6 +9,7 @@ PROFILES = ("default", "device", "pikvm", "pocket")
 
 @pytest.fixture
 def fleet(tmp_path):
+    """Return a builder; calling it twice writes both fleets into the same tmp_path."""
     return lambda spec: make_fleet(tmp_path, spec)
 
 

@@ -5,7 +5,7 @@ from tests.fleet import dir_hash_md5
 
 def _manifest(skills_dir):
     entries = {}
-    for line in (skills_dir / ".bundled_manifest").read_text().splitlines():
+    for line in (skills_dir / ".bundled_manifest").read_text(encoding="utf-8").splitlines():
         name, _, digest = line.partition(":")
         entries[name] = digest
     return entries
@@ -25,7 +25,9 @@ def test_device_has_duplicate_skill(classic_fleet):
     device = classic_fleet / "profiles" / "device" / "skills"
     assert (device / "a" / "dup" / "SKILL.md").is_file()
     assert (device / "b" / "dup" / "SKILL.md").is_file()
-    assert (device / "a" / "dup" / "SKILL.md").read_text() != (device / "b" / "dup" / "SKILL.md").read_text()
+    assert (device / "a" / "dup" / "SKILL.md").read_text(encoding="utf-8") != (
+        device / "b" / "dup" / "SKILL.md"
+    ).read_text(encoding="utf-8")
 
 
 def test_pristine_bundled_matches_manifest(classic_fleet):
@@ -48,7 +50,7 @@ def test_default_bundled_edited_matches_origin(classic_fleet):
 def test_hub_lock_records_hubskill(classic_fleet):
     import json
 
-    lock = json.loads((classic_fleet / "skills" / ".hub" / "lock.json").read_text())
+    lock = json.loads((classic_fleet / "skills" / ".hub" / "lock.json").read_text(encoding="utf-8"))
     entry = lock["installed"]["hubskill"]
     assert entry["install_path"] == "tools/hubskill"
     assert entry["content_hash"].startswith("sha256:")
@@ -64,5 +66,5 @@ def test_linked_is_symlink(classic_fleet):
 def test_config_starts_empty(classic_fleet):
     import yaml
 
-    cfg = yaml.safe_load((classic_fleet / "profiles" / "pocket" / "config.yaml").read_text())
+    cfg = yaml.safe_load((classic_fleet / "profiles" / "pocket" / "config.yaml").read_text(encoding="utf-8"))
     assert cfg == {"skills": {}, "plugins": {"enabled": []}}
