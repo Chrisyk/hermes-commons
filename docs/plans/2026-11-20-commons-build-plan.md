@@ -255,7 +255,7 @@ Test with monkeypatched fake modules in `sys.modules`.
 
 ### Task 5.3: CLI and slash command (`commons/cli.py`, `commons/__init__.py`)
 
-`setup_fn(parser)` adds subcommands `setup [--root PATH] [--choose S=...] [--apply] [--yes]`, `status [--profile] [--skill]`, `check [--fix-safe] [--quiet]`, `promote S [--from P]`, `demote S --to P`, `merge [--next|--accept S|--skip S] [--force]`, `log [S]`, `undo S [--to SHA]`, `restore [ID] [--cascade] [--yes]`. Writing commands print the plan and ask `[y/N]`; without a TTY and without `--yes` they exit 2 with "needs confirmation; rerun with --yes". `register(ctx)` registers hooks, `ctx.register_cli_command("commons", ...)` and `ctx.register_command("commons", slash_handler, args_hint="status|check")`, where the slash handler only allows `status` and `check`. Tests drive `handler_fn` with parsed args against the classic fleet (adapter monkeypatched).
+`setup_fn(parser)` adds subcommands `setup [--root PATH] [--choose S=...] [--apply] [--yes]`, `status [--only P] [--skill S]`, `check [--fix-safe] [--quiet]`, `promote S [--from P]`, `demote S --to P`, `merge [--next|--accept S|--skip S] [--force]`, `log [S]`, `undo S [--to SHA]`, `restore [ID] [--cascade] [--yes]`. Writing commands print the plan and ask `[y/N]`; without a TTY and without `--yes` they exit 2 with "needs confirmation; rerun with --yes". `register(ctx)` registers hooks, `ctx.register_cli_command("commons", ...)` and `ctx.register_command("commons", slash_handler, args_hint="status|check")`, where the slash handler only allows `status` and `check`. Tests drive `handler_fn` with parsed args against the classic fleet (adapter monkeypatched).
 
 ### Task 5.4: Commons skill (plugin-shipped)
 

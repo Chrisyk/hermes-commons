@@ -13,7 +13,22 @@ also hermes_cli/data/plugin_api.json, which `hermes plugins validate` reads):
 - tools.skill_usage.read_skill_name
 
 A missing module or name raises HermesApiChanged, which names the symbol, so
-a Hermes release that moves one fails loudly instead of half working.
+a Hermes release that moves one fails loudly instead of half working. So does
+a TypeError or AttributeError from calling one (a changed signature or return
+shape).
+
+COMMONS_HERMES_ROOT (for testing and sandboxes only): when set to a folder,
+it replaces the Hermes root for every path commons uses: default_root (and
+with it fleet, the profiles under <root>/profiles, the default shared root
+and the state dir <root>/commons), the active profile (the default profile
+of that root: Hermes' own active profile belongs to the real root), locate
+(answered by commons.core.resolve over that profile, not by Hermes), and
+is_deleted (the same tombstone path Hermes checks, under that root). The
+config writer then writes config.yaml directly with the core YamlFileWriter
+instead of running `hermes config set`, which would target the real
+profiles, and cron scheduling is refused (it would create a job in the real
+default profile). Hashing and the bundled index still use Hermes code, which
+reads no profile.
 
 Two things have no public API and are mirrored here instead (keep in step
 with Hermes v0.23.1):
@@ -46,7 +61,10 @@ from commons.core.layout import Layout
 from commons.core.report import shared_root_of
 from commons.core.scan import EXCLUDED_SKILL_DIRS, SKILL_FILE, SKILL_SUPPORT_DIRS
 
+ROOT_ENV = "COMMONS_HERMES_ROOT"
 STATE_DIR_NAME = "commons"
+# Mirror of hermes_constants._DELETED_PROFILES_DIR (profile_tombstone_path), used under ROOT_ENV only.
+_DELETED_PROFILES_DIR = ".deleted"
 SHARED_DIR_NAME = "shared-skills"
 DEFAULT_CLI_TIMEOUT = 60.0
 # Mirror of hermes_constants.PROFILE_ID_RE (the -p grammar).
@@ -59,22 +77,48 @@ class HermesApiChanged(RuntimeError):
 
 @contextlib.contextmanager
 def _api(symbol: str) -> Iterator[None]:
+    """Turn a missing symbol (ImportError) or a changed one (TypeError, AttributeError) into HermesApiChanged."""
     try:
         yield
     except ImportError as exc:
         raise HermesApiChanged(
             f"Hermes no longer provides {symbol}; this commons release does not match the installed Hermes"
         ) from exc
+    except (TypeError, AttributeError) as exc:
+        raise HermesApiChanged(
+            f"Hermes changed {symbol} ({type(exc).__name__}: {exc});"
+            " this commons release does not match the installed Hermes"
+        ) from exc
+
+
+def root_override() -> Path | None:
+    """The COMMONS_HERMES_ROOT folder, or None when it is unset or empty (see module docstring)."""
+    value = os.environ.get(ROOT_ENV, "").strip()
+    return Path(value).expanduser().absolute() if value else None
+
+
+def ensure_cron_allowed() -> None:
+    """Raise RuntimeError while COMMONS_HERMES_ROOT is set: a cron job would land in the real profile."""
+    root = root_override()
+    if root is not None:
+        raise RuntimeError(
+            f"cron scheduling is refused while {ROOT_ENV} is set ({root}): the job would be created in the"
+            " real default profile"
+        )
 
 
 # ------------------------------------------------------------------ paths and profiles
 
 
 def default_root() -> Path:
-    """The Hermes root: the default profile's home, parent of profiles/."""
+    """The Hermes root: the default profile's home, parent of profiles/ (COMMONS_HERMES_ROOT if set)."""
+    override = root_override()
+    if override is not None:
+        return override
     with _api("hermes_constants.get_default_hermes_root"):
         from hermes_constants import get_default_hermes_root
-    return Path(get_default_hermes_root())
+
+        return Path(get_default_hermes_root())
 
 
 def state_dir() -> Path:
@@ -83,21 +127,33 @@ def state_dir() -> Path:
 
 
 def active_profile_home() -> Path:
+    override = root_override()
+    if override is not None:
+        return override
     with _api("hermes_constants.get_hermes_home"):
         from hermes_constants import get_hermes_home
-    return Path(get_hermes_home())
+
+        return Path(get_hermes_home())
 
 
 def active_profile_name() -> str:
+    if root_override() is not None:
+        return DEFAULT_PROFILE
+    home = active_profile_home()
     with _api("hermes_constants.profile_name_for_home"):
         from hermes_constants import profile_name_for_home
-    return profile_name_for_home(active_profile_home()) or DEFAULT_PROFILE
+
+        return profile_name_for_home(home) or DEFAULT_PROFILE
 
 
 def is_deleted(path: Path) -> bool:
+    if root_override() is not None:
+        home = Path(path)
+        return (home.parent / _DELETED_PROFILES_DIR / home.name).exists()
     with _api("hermes_constants.named_profile_is_deleted"):
         from hermes_constants import named_profile_is_deleted
-    return bool(named_profile_is_deleted(path))
+
+        return bool(named_profile_is_deleted(path))
 
 
 def fleet() -> list[Profile]:
@@ -117,7 +173,8 @@ def layout(profiles: Sequence[Profile], shared_root: Path | None = None) -> Layo
 def md5_dir_hash(directory: Path) -> str:
     with _api("tools.skills_sync.dir_hash"):
         from tools.skills_sync import dir_hash
-    return dir_hash(Path(directory))
+
+        return dir_hash(Path(directory))
 
 
 def _content_digest(skill_path: Path) -> str:
@@ -140,9 +197,12 @@ def hub_hash(path: Path) -> str:
 def _bundled_dir() -> Path:
     with _api("hermes_cli.config.get_project_root"):
         from hermes_cli.config import get_project_root
+
+        project = Path(get_project_root())
     with _api("hermes_constants.get_bundled_skills_dir"):
         from hermes_constants import get_bundled_skills_dir
-    return Path(get_bundled_skills_dir(Path(get_project_root()) / "skills"))
+
+        return Path(get_bundled_skills_dir(project / "skills"))
 
 
 def _excluded(rel: PurePath, root: Path) -> bool:
@@ -166,7 +226,9 @@ def bundled_index() -> Callable[[str], str | None]:
         for md in sorted(root.rglob(SKILL_FILE)):
             if _excluded(md.relative_to(root), root):
                 continue
-            folders.setdefault(read_skill_name(md, md.parent.name), md.parent)
+            with _api("tools.skill_usage.read_skill_name"):
+                found = read_skill_name(md, md.parent.name)
+            folders.setdefault(found, md.parent)
     hashes: dict[str, str] = {}
 
     def lookup(name: str) -> str | None:
@@ -183,18 +245,34 @@ def bundled_index() -> Callable[[str], str | None]:
 # ------------------------------------------------------------------ skill lookup
 
 
+def _locate_under_override(name: str) -> Path | None:
+    from commons.core.resolve import resolve
+
+    home = active_profile_home()
+    profile = Profile(DEFAULT_PROFILE, home, load_config(home / CONFIG_FILE))
+    found = resolve(profile, md5_dir_hash, hub_hash).get(name)
+    if found is None or found.winner_path is None:
+        return None
+    return found.winner.path if found.winner is not None else found.winner_path
+
+
 def locate(name: str) -> Path | None:
     """The folder (or legacy flat .md) skill_view(name) would load in the active profile, else None."""
+    if root_override() is not None:
+        return _locate_under_override(name)
     with _api("tools.skills_tool.skill_lookup_path_error"):
         from tools.skills_tool import skill_lookup_path_error
     with _api("tools.skills_tool.skill_search_dirs"):
         from tools.skills_tool import skill_search_dirs
     with _api("tools.skills_tool.locate_skill"):
         from tools.skills_tool import locate_skill
-    if skill_lookup_path_error(name):
-        return None
-    roots, _active = skill_search_dirs()
-    error, skill_dir, skill_md = locate_skill(name, None, roots)
+    with _api("tools.skills_tool.skill_lookup_path_error"):
+        if skill_lookup_path_error(name):
+            return None
+    with _api("tools.skills_tool.skill_search_dirs"):
+        roots, _active = skill_search_dirs()
+    with _api("tools.skills_tool.locate_skill"):
+        error, skill_dir, skill_md = locate_skill(name, None, roots)
     if error is not None:
         return None
     found = skill_dir if skill_dir is not None else skill_md
@@ -207,7 +285,15 @@ def locate(name: str) -> Path | None:
 def hermes_command(args: Sequence[str]) -> list[str]:
     with _api("hermes_cli.chat_launch.hermes_command"):
         from hermes_cli.chat_launch import hermes_command as command
-    return list(command(list(args)))
+
+        return list(command(list(args)))
+
+
+def config_writer():
+    """The ConfigWriter for this run: HermesCliWriter, or YamlFileWriter under COMMONS_HERMES_ROOT."""
+    if root_override() is not None:
+        return YamlFileWriter()
+    return HermesCliWriter(root=default_root())
 
 
 class HermesCliWriter:

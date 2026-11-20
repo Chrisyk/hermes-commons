@@ -24,6 +24,8 @@ profile's scripts/ dir, Hermes cron/scheduler_script.py), as verified with
       --name "commons hourly check" --no-agent
 --no-agent runs the script with no model call and delivers its stdout
 verbatim; empty stdout (check --quiet with nothing wrong) is silent.
+--schedule cannot be combined with --choose, and scheduling is refused while
+COMMONS_HERMES_ROOT is set (see hermes_adapter).
 """
 
 from __future__ import annotations
@@ -217,7 +219,7 @@ def _profile(profiles: Sequence[Profile], name: str) -> Profile:
 
 
 def _writer():
-    return ha.HermesCliWriter(root=ha.default_root())
+    return ha.config_writer()
 
 
 def _bundled_index():
@@ -268,7 +270,13 @@ def cmd_setup(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         return _setup_apply(args, out, err, resume=args.resume)
     if args.apply:
         return _setup_apply(args, out, err)
-    if args.schedule and not args.choose:
+    if args.schedule and args.choose:
+        err.write(
+            "commons: --schedule cannot be combined with --choose; make the choices first, then run"
+            " `hermes commons setup --schedule`\n"
+        )
+        return 2
+    if args.schedule:
         return _schedule(args, out, err)
     profiles = ha.fleet()
     layout = ha.layout(profiles, args.root)
@@ -305,6 +313,8 @@ def _plan_lines(prop: Proposal) -> list[str]:
 
 
 def _setup_apply(args: argparse.Namespace, out: TextIO, err: TextIO, resume: str | None = None) -> int:
+    if args.schedule:
+        ha.ensure_cron_allowed()  # refuse before anything is applied, not after
     if resume is not None:
         prop = load_setup_proposal(Layout(Path("."), Path(ha.state_dir())), resume)
         what = f"resume the interrupted setup {resume}"
@@ -403,6 +413,7 @@ def schedule_check(
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> str:
     """Write the script and create the cron job; return what happened. Raises RuntimeError on failure."""
+    ha.ensure_cron_allowed()
     command = command or ha.hermes_command
     if _scheduled(root):
         return f"the {CRON_NAME!r} cron job already exists"
@@ -420,6 +431,7 @@ def schedule_check(
 
 
 def _schedule(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    ha.ensure_cron_allowed()
     root = ha.default_root()
     out.write(
         f"commons will write {root / 'scripts' / SCRIPT_NAME} and create a script-only cron job"
@@ -435,6 +447,9 @@ def _schedule(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
 def _offer_schedule(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     root = ha.default_root()
     if _scheduled(root):
+        return 0
+    if ha.root_override() is not None:
+        out.write(f"hourly check not offered: {ha.ROOT_ENV} is set\n")
         return 0
     if args.schedule:
         out.write(schedule_check(root) + "\n")
@@ -640,7 +655,8 @@ def cmd_undo(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     elif rows:
         out.write(f"undo {args.skill}: revert {rows[0][0][:12]} {rows[0][2]}\n")
     else:
-        out.write(f"undo {args.skill}: it has no commits\n")
+        err.write(f"commons: {args.skill} has no commits in the shared root; nothing to undo\n")
+        return 1
     code = _asked("Undo it?", args, out, err)
     if code is not None:
         return code

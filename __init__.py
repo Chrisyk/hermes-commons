@@ -7,6 +7,12 @@ manager installed this project (pyproject.toml) into its environment. When it
 did not (a plugin dir copied by hand, or `hermes plugins validate` without
 --install-deps), commons/ is loaded from beside this file under its own
 name, the way an install would provide it. No sys.path change is made.
+
+Single module identity: Hermes gives this module __path__ = [plugin dir], so
+without care `hermes_plugins.<name>.commons.core.configio` would import as a
+second copy of every commons module (with its own ConfigError, its own hook
+worker, ...). __path__ is emptied once commons is loaded, so commons.* is the
+only name its modules have; this file needs no submodules of its own.
 """
 
 from __future__ import annotations
@@ -43,5 +49,8 @@ def _commons():
 
 
 register = _commons().register
+
+# No submodules through the plugin package (see the module docstring).
+__path__: list[str] = []
 
 __all__ = ["register"]

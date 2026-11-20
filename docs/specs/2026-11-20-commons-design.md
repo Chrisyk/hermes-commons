@@ -80,7 +80,7 @@ Measured on Chris's fleet: containment resolved 11 of 53; 42 needed a real merge
 | Command | Does | Writes? |
 |---|---|---|
 | `setup` | Scan, report, propose, then on approval apply and verify. Re-runnable: on a fleet already set up it adopts the existing shared root and only proposes what is left. | Only after approval |
-| `status [--profile P] [--skill S]` | Per profile, every skill with its source; totals; prompt-index size per profile. | No |
+| `status [--only P] [--skill S]` | Per profile, every skill with its source; totals; prompt-index size per profile. | No |
 | `check [--fix-safe] [--quiet]` | Drift report (see below). `--fix-safe` commits uncommitted changes in the shared root and nothing else. `--quiet` prints only when something is wrong (for cron). | Only with --fix-safe |
 | `promote S [--from P]` | Move a profile's own skill into the shared root; other profiles' copies of S become shadow findings for the user to resolve. Backup first. | Yes, after confirm |
 | `demote S --to P` | Copy a shared skill into one profile's own folder (an intentional private override) and record it as intentional so `check` stops flagging it. | Yes, after confirm |
@@ -131,6 +131,7 @@ Short (well under 2k chars), description 60 chars or less. Says: shared skills l
 - pytest with synthetic Hermes roots in tmp dirs (default plus 3 profiles) covering identical, contained, conflicting, bundled, hub, symlink and in-profile duplicate cases; setup apply then restore must reproduce the original trees byte for byte.
 - Hook tests: simulated `on_skill_lifecycle` calls produce exactly one commit per edit; concurrent calls from two processes do not corrupt the repo.
 - `hermes plugins validate <repo> --install-deps` passes with no failures.
+- `COMMONS_HERMES_ROOT=<folder>` (testing and sandboxes only) makes the real CLI treat that folder as the Hermes root for every path commons uses (profiles, shared root default, state dir, active profile, locate); config.yaml is then written directly instead of through `hermes config set`, and cron scheduling is refused.
 - End-to-end on a sandbox copy of Chris's real fleet from this morning's backup tars (`~/.hermes/backups/skills-unify-*`), never the live one: setup must report the same 246/53 picture and the result must match what the manual consolidation produced. Chris's skills are never committed to the public repo as fixtures.
 - Adopt test on Chris's live fleet (already consolidated): `setup` must detect the existing shared root and propose no moves; `status` and `check` must be clean except known findings.
 

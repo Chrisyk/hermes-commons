@@ -307,3 +307,129 @@ def test_writer_refuses_a_profile_outside_its_root(tmp_path):
     with pytest.raises(ConfigError, match="refusing to write"):
         w.set(Profile("dev", tmp_path / "elsewhere"), "skills.create_dir", "/x")
     assert runner.calls == []
+
+
+# ------------------------------------------------------------------ COMMONS_HERMES_ROOT
+
+
+def _poisoned_hermes(monkeypatch):
+    """Every profile-reading Hermes symbol raises: under the override none may be called."""
+
+    def boom(*_a, **_k):
+        raise AssertionError("a Hermes path function was called under COMMONS_HERMES_ROOT")
+
+    _fake(
+        monkeypatch,
+        "hermes_constants",
+        get_default_hermes_root=boom,
+        get_hermes_home=boom,
+        profile_name_for_home=boom,
+        named_profile_is_deleted=boom,
+    )
+    _fake(
+        monkeypatch,
+        "tools.skills_tool",
+        skill_lookup_path_error=boom,
+        skill_search_dirs=boom,
+        locate_skill=boom,
+    )
+    _fake(monkeypatch, "hermes_cli.chat_launch", hermes_command=boom)
+
+
+@pytest.fixture
+def sandbox(tmp_path, monkeypatch):
+    root = tmp_path / "sandbox"
+    shared = tmp_path / "shared"
+    for home in (root, root / "profiles" / "dev", root / "profiles" / "gone"):
+        (home / "skills").mkdir(parents=True)
+        (home / "config.yaml").write_text(f"skills:\n  create_dir: {shared}\n", encoding="utf-8")
+    (root / "profiles" / ".deleted" / "gone").mkdir(parents=True)  # Hermes' tombstone
+    write_files(shared / "general" / "foo", {"SKILL.md": skill_md("foo", "d", ["a"])})
+    write_files(root / "skills" / "local" / "bar", {"SKILL.md": skill_md("bar", "d", ["b"])})
+    _poisoned_hermes(monkeypatch)
+    monkeypatch.setenv(ha.ROOT_ENV, str(root))
+    return {"root": root, "shared": shared}
+
+
+def test_override_root_and_every_path(sandbox):
+    root = sandbox["root"]
+    assert ha.root_override() == root
+    assert ha.default_root() == root
+    assert ha.state_dir() == root / "commons"
+    assert ha.active_profile_home() == root
+    assert ha.active_profile_name() == "default"
+    assert ha.is_deleted(root / "profiles" / "gone") is True
+    assert ha.is_deleted(root / "profiles" / "dev") is False
+    profiles = ha.fleet()
+    assert {p.name: p.home for p in profiles} == {"default": root, "dev": root / "profiles" / "dev"}
+    lay = ha.layout(profiles)
+    assert lay.shared_root == sandbox["shared"] and lay.state_dir == root / "commons"
+    for p in profiles:
+        assert p.home.is_relative_to(root)
+
+
+def test_override_default_shared_root_is_under_the_sandbox(tmp_path, monkeypatch):
+    root = tmp_path / "bare"
+    (root / "skills").mkdir(parents=True)
+    (root / "config.yaml").write_text("{}\n", encoding="utf-8")
+    _poisoned_hermes(monkeypatch)
+    monkeypatch.setenv(ha.ROOT_ENV, str(root))
+    assert ha.layout(ha.fleet()).shared_root == root / ha.SHARED_DIR_NAME
+
+
+def test_override_locate_reads_the_sandbox(sandbox):
+    assert ha.locate("foo") == sandbox["shared"] / "general" / "foo"
+    assert ha.locate("bar") == sandbox["root"] / "skills" / "local" / "bar"
+    assert ha.locate("nope") is None
+    assert ha.locate("../x") is None
+
+
+def test_override_writer_writes_yaml_directly_and_cron_is_refused(sandbox):
+    from commons.core.configio import YamlFileWriter
+
+    writer = ha.config_writer()
+    assert isinstance(writer, YamlFileWriter)
+    dev = next(p for p in ha.fleet() if p.name == "dev")
+    assert writer.add_to_list(dev, "plugins.enabled", "commons") == "edited"
+    assert yaml.safe_load((dev.home / "config.yaml").read_text())["plugins"]["enabled"] == ["commons"]
+    with pytest.raises(RuntimeError, match="COMMONS_HERMES_ROOT"):
+        ha.ensure_cron_allowed()
+
+
+def test_empty_override_is_ignored(monkeypatch, tmp_path):
+    monkeypatch.setenv(ha.ROOT_ENV, "  ")
+    _fake(monkeypatch, "hermes_constants", get_default_hermes_root=lambda: tmp_path)
+    assert ha.root_override() is None
+    assert ha.default_root() == tmp_path
+    assert isinstance(ha.config_writer(), ha.HermesCliWriter)
+    ha.ensure_cron_allowed()
+
+
+# ------------------------------------------------------------------ changed signatures
+
+
+def test_changed_signature_raises_hermes_api_changed(monkeypatch, tmp_path):
+    monkeypatch.delenv(ha.ROOT_ENV, raising=False)
+    _fake(
+        monkeypatch,
+        "hermes_constants",
+        get_default_hermes_root=lambda required: tmp_path,  # now needs an argument
+        get_hermes_home=lambda: None,  # returns a shape Path() rejects
+        profile_name_for_home=lambda: "x",
+    )
+    with pytest.raises(ha.HermesApiChanged, match="get_default_hermes_root.*TypeError"):
+        ha.default_root()
+    with pytest.raises(ha.HermesApiChanged, match="get_hermes_home"):
+        ha.active_profile_home()
+    _fake(monkeypatch, "tools.skills_sync", dir_hash=lambda d: d.no_such_attribute)
+    with pytest.raises(ha.HermesApiChanged, match="dir_hash.*AttributeError"):
+        ha.md5_dir_hash(tmp_path)
+    _fake(
+        monkeypatch,
+        "tools.skills_tool",
+        skill_lookup_path_error=lambda n: None,
+        skill_search_dirs=lambda: None,  # no longer a pair
+        locate_skill=lambda n, l, r: (None, None, None),
+    )
+    with pytest.raises(ha.HermesApiChanged, match="skill_search_dirs"):
+        ha.locate("foo")

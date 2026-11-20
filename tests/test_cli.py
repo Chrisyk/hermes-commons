@@ -44,6 +44,7 @@ def env(classic_fleet, monkeypatch):
     monkeypatch.setattr(ha, "HermesCliWriter", lambda **kw: YamlFileWriter())
     monkeypatch.setattr("sys.stdin", io.StringIO(""))  # no TTY unless a test says so
     monkeypatch.setattr(cli, "home_dir", lambda: root)
+    monkeypatch.delenv(ha.ROOT_ENV, raising=False)
     return {"root": root, "state": state, "shared": root / "shared", "layout": layout(None)}
 
 
@@ -428,3 +429,93 @@ def test_restore_cascade_core_order(env):
     assert later_operations(lay, setup_id) == later[1:]
     res = restore_cascade(lay, setup_id, discover(env["root"]), YamlFileWriter())
     assert [bid for bid, _r in res.restored] == [later[1], setup_id]
+
+
+# ------------------------------------------------------------------ one module identity
+
+_IDENTITY_PROBE = """
+import importlib, importlib.util, sys, types
+repo, site = sys.argv[1], sys.argv[2]
+if site:
+    sys.path.append(site)  # PyYAML only: with -S the editable install of commons is not active
+ns = types.ModuleType("hermes_plugins"); ns.__path__ = []; sys.modules["hermes_plugins"] = ns
+# As hermes_cli/plugins_loader.py _load_directory_module does it.
+spec = importlib.util.spec_from_file_location(
+    "hermes_plugins.commons", repo + "/__init__.py", submodule_search_locations=[repo])
+mod = importlib.util.module_from_spec(spec)
+mod.__package__ = spec.name
+mod.__path__ = [repo]
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+import commons.core.configio as direct
+from commons import hermes_adapter
+from commons.core.configio import ConfigError
+assert direct.ConfigError is ConfigError is hermes_adapter.ConfigError
+for name in ("hermes_plugins.commons.commons.core.configio", "hermes_plugins.commons.commons"):
+    try:
+        other = importlib.import_module(name)
+    except ImportError:
+        continue
+    assert getattr(other, "ConfigError", ConfigError) is ConfigError, name
+copies = sorted(k for k in sys.modules if k.endswith("configio"))
+assert copies == ["commons.core.configio"], copies
+print("OK", sys.modules["commons"].__file__)
+"""
+
+
+@pytest.mark.parametrize("installed", [True, False])
+def test_config_error_has_one_identity_however_imported(tmp_path, installed):
+    import subprocess
+    import sys
+    import sysconfig
+    from pathlib import Path
+
+    repo = Path(commons.__file__).resolve().parent.parent
+    probe = tmp_path / "probe.py"
+    probe.write_text(_IDENTITY_PROBE, encoding="utf-8")
+    flags = ["-I"] if installed else ["-I", "-S"]
+    site = "" if installed else sysconfig.get_paths()["purelib"]
+    proc = subprocess.run(
+        [sys.executable, *flags, str(probe), str(repo), site],
+        check=False,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.startswith("OK") and str(repo / "commons" / "__init__.py") in proc.stdout
+
+
+# ------------------------------------------------------------------ minor refusals
+
+
+def test_schedule_with_choose_is_an_error(env, capsys):
+    run("setup")
+    capsys.readouterr()
+    assert run("setup", "--schedule", "--choose", "conflict=keep:default", "--yes") == 2
+    assert "--schedule cannot be combined with --choose" in capsys.readouterr().err
+    assert not (env["root"] / "scripts").exists()
+
+
+def test_schedule_is_refused_under_the_root_override(env, monkeypatch, capsys):
+    monkeypatch.setenv(ha.ROOT_ENV, str(env["root"]))
+    before = snapshot(env["root"])
+    assert run("setup", "--schedule", "--yes") == 1
+    assert "cron scheduling is refused" in capsys.readouterr().err
+    run("setup")
+    assert run("setup", "--apply", "--yes", "--schedule") == 1
+    assert snapshot(env["root"]) == before  # refused before anything was applied
+    assert not (env["root"] / "scripts").exists()
+    with pytest.raises(RuntimeError, match="COMMONS_HERMES_ROOT"):
+        cli.schedule_check(env["root"], command=lambda a: ["hermes", *a], runner=lambda *a, **k: None)
+
+
+def test_undo_with_no_commits_fails_before_asking(env, monkeypatch, capsys):
+    applied(env)
+    capsys.readouterr()
+    write_files(env["shared"] / "general" / "fresh", {"SKILL.md": skill_md("fresh", "Uncommitted.", ["x"])})
+    monkeypatch.setattr("sys.stdin", FakeTTY("y\n"))
+    assert run("undo", "fresh") == 1
+    io_ = capsys.readouterr()
+    assert "has no commits" in io_.err and "[y/N]" not in io_.out
