@@ -140,7 +140,9 @@ def conflict_ready(root, with_shared: bool = False):
     prop = None
     if with_shared:
         shared_dir = lay.shared_root / "general" / "conflict"
-        write_files(shared_dir, {"SKILL.md": skill_md("conflict", "Diverged copies.", ["A", "S_shared_only"])})
+        write_files(
+            shared_dir, {"SKILL.md": skill_md("conflict", "Diverged copies.", ["A", "S_shared_only"])}
+        )
         GitRepo(lay.shared_root).commit_paths([shared_dir], "add shared conflict")
         prop = build_proposal(discover(root), lay, dir_hash_md5, hub_content_hash, {}, home=root)
     skip(lay, "bundled-edited")
@@ -215,7 +217,9 @@ def test_crash_in_promote_is_restored(classic_fleet, monkeypatch, n):
     calls = run_crashing(
         monkeypatch,
         n,
-        lambda: promote("fresh", "pocket", layout_for(root), discover(root), dir_hash_md5, hub_content_hash, LATER),
+        lambda: promote(
+            "fresh", "pocket", layout_for(root), discover(root), dir_hash_md5, hub_content_hash, LATER
+        ),
     )
     if n == 0:
         assert calls == ["shared_copy", "commit", "retire"]
@@ -227,7 +231,9 @@ def test_crash_in_demote_is_restored(classic_fleet, monkeypatch, n):
     root = classic_fleet
     set_up(root)
     before = state(root)
-    calls = run_crashing(monkeypatch, n, lambda: demote("same", "pikvm", layout_for(root), discover(root), LATER))
+    calls = run_crashing(
+        monkeypatch, n, lambda: demote("same", "pikvm", layout_for(root), discover(root), LATER)
+    )
     if n == 0:
         assert calls == ["profile_copy", "config_json", "commit"]
     check_back(root, before)

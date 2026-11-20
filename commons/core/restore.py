@@ -247,7 +247,9 @@ def operations(layout: Layout) -> list[str]:
 def later_operations(layout: Layout, backup_id: str) -> list[str]:
     """Operations made after *backup_id* and not restored yet, newest first (see module docstring)."""
     mine = _order_key(layout, backup_id)
-    return [bid for bid in reversed(operations(layout)) if bid != backup_id and _order_key(layout, bid) > mine]
+    return [
+        bid for bid in reversed(operations(layout)) if bid != backup_id and _order_key(layout, bid) > mine
+    ]
 
 
 def later_operations_message(backup_id: str, later: Sequence[str]) -> str:
@@ -330,7 +332,11 @@ def _plan_cron(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> Non
     args = i["args"]
     plan.cron.append(
         CronPlan(
-            args["profile"], Path(args["path"]), Path(args["backup_copy"]), args["sha_before"], args["sha_after"]
+            args["profile"],
+            Path(args["path"]),
+            Path(args["backup_copy"]),
+            args["sha_before"],
+            args["sha_after"],
         )
     )
 
@@ -341,7 +347,9 @@ def _plan_md(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
     args = i["args"]
     current = file_sha256(Path(args["path"]))
     if current == args["sha_after"]:
-        plan.md_rewrites.append(f"{args['path']} was rewritten by setup; kept (original at {args['backup_copy']})")
+        plan.md_rewrites.append(
+            f"{args['path']} was rewritten by setup; kept (original at {args['backup_copy']})"
+        )
     elif current != args["sha_before"]:
         plan.undecided.append(f"shared root: {args['path']} changed since setup rewrote it; kept")
 
@@ -686,7 +694,9 @@ class _Undo:
                 self.result.reports.append(f"shared root: retired copy {dst} is missing; {src} not restored")
             return
         if tree_sha256(dst) != args.get("fingerprint"):
-            self.result.reports.append(f"shared root: retired copy {dst} does not match the journal; left there")
+            self.result.reports.append(
+                f"shared root: retired copy {dst} does not match the journal; left there"
+            )
             return
         move_noreplace(dst, src)
         self.result.done.append(f"shared: {args['rel']} put back")
@@ -713,7 +723,9 @@ class _Undo:
         if _exists(src) or not _exists(dst):
             return  # already back (git restored it), or never moved
         if path_sha256(dst) != args.get("fingerprint"):
-            self.result.reports.append(f"shared root: set-aside copy {dst} does not match the journal; left there")
+            self.result.reports.append(
+                f"shared root: set-aside copy {dst} does not match the journal; left there"
+            )
             return
         move_noreplace(dst, src)
         self.result.done.append(f"shared: {src.relative_to(self.root)} put back")

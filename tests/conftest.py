@@ -7,6 +7,12 @@ from tests.fleet import make_fleet, skill_md
 PROFILES = ("default", "device", "pikvm", "pocket")
 
 
+@pytest.fixture(autouse=True)
+def _no_sandbox_root(monkeypatch):
+    """Keep a COMMONS_HERMES_ROOT exported in the shell from leaking into tests."""
+    monkeypatch.delenv("COMMONS_HERMES_ROOT", raising=False)
+
+
 @pytest.fixture
 def fleet(tmp_path):
     """Return a builder; calling it twice writes both fleets into the same tmp_path."""

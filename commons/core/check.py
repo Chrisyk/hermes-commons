@@ -264,7 +264,9 @@ def _skill_findings(shared_root: Path, copies) -> list[Finding]:
         missing = missing_files(c.path, links)
         if missing:
             out.append(
-                _warn("missing-ref", None, c.name, f"{c.rel}/{SKILL_FILE} links to missing {', '.join(missing)}")
+                _warn(
+                    "missing-ref", None, c.name, f"{c.rel}/{SKILL_FILE} links to missing {', '.join(missing)}"
+                )
             )
         mentioned = missing_files(c.path, mentions)
         if mentioned:
@@ -400,7 +402,11 @@ def _override_findings(profiles, overrides) -> list[Finding]:
     out = []
     local: dict[str, set[str]] = {}
     for o in overrides if isinstance(overrides, list) else []:
-        if not isinstance(o, Mapping) or not isinstance(o.get("profile"), str) or not isinstance(o.get("name"), str):
+        if (
+            not isinstance(o, Mapping)
+            or not isinstance(o.get("profile"), str)
+            or not isinstance(o.get("name"), str)
+        ):
             continue
         prof, name = o["profile"], o["name"]
         p = by_name.get(prof)

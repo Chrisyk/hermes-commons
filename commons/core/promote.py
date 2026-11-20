@@ -154,7 +154,6 @@ def _promote(
     with operation(layout, touched, f"promote-{name}", "promote", now) as op:
         sha = None
         if existing is None:
-
             op.copy_in("shared_copy", name, copy.path, target)
             if not same_content(copy.path, target):
                 raise PromoteError(f"{name}: the copy at {target} does not match {copy.path}")

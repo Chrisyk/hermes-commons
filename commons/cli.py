@@ -170,6 +170,9 @@ def handler_fn(args: argparse.Namespace) -> int:
 
 def run_command(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     command = getattr(args, "commons_command", None) or "status"
+    sandbox = os.environ.get("COMMONS_HERMES_ROOT")
+    if sandbox:
+        err.write(f"commons: COMMONS_HERMES_ROOT is set; working on {sandbox}, not the real Hermes root\n")
     try:
         return COMMANDS[command](args, out, err)
     except _ERRORS as exc:
@@ -735,7 +738,9 @@ def cmd_restore(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
             layout, plan.backup_id, profiles, _writer(), copy_new_to=copy_to or None
         ).restored
     else:
-        steps = [(plan.backup_id, restore_mod.restore(plan, profiles, _writer(), copy_new_to=copy_to or None))]
+        steps = [
+            (plan.backup_id, restore_mod.restore(plan, profiles, _writer(), copy_new_to=copy_to or None))
+        ]
     for bid, res in steps:
         out.write(f"restored {bid} (a pre-restore backup is {res.pre_restore_backup_id})\n")
         _lines(out, "done", res.done)

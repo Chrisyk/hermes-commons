@@ -159,7 +159,9 @@ def test_missing_reference_that_no_variant_has_is_only_a_note(classic_fleet):
 
 def test_missing_reference_that_a_variant_has_blocks_accept(classic_fleet):
     root = classic_fleet
-    write_files(profile_home(root, "device") / "skills" / "general" / "conflict", {"references/extra.md": "x\n"})
+    write_files(
+        profile_home(root, "device") / "skills" / "general" / "conflict", {"references/extra.md": "x\n"}
+    )
     lay = set_up(root)
     task = conflict_task(lay)
     prepare(task, "variant:default")
@@ -231,5 +233,5 @@ def test_code_span_pattern_is_the_backtick_pattern():
     assert tick not in merge_mod._CODE_SPAN.pattern
     expected = "(T+)(?!T).+?(?<!T)\\1(?!T)".replace("T", tick)
     assert merge_mod._CODE_SPAN.pattern.replace("\\x60", tick) == expected
-    sample = f"a {tick}[x](references/a.md){tick} b {tick*2}c{tick}d{tick*2} e"
+    sample = f"a {tick}[x](references/a.md){tick} b {tick * 2}c{tick}d{tick * 2} e"
     assert merge_mod._CODE_SPAN.sub("", sample) == "a  b  e"

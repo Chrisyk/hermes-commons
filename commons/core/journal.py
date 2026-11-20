@@ -184,7 +184,9 @@ class Operation:
         after = locate_without(index, name, [p.skills_dir / rel for rel in rels])
         if after.winner_path is None or not after.winner_path.is_relative_to(shared):
             where = after.winner_path or "nothing"
-            return f"{profile} would load {name} from {where}, not the shared root; its copy was left in place"
+            return (
+                f"{profile} would load {name} from {where}, not the shared root; its copy was left in place"
+            )
         return None
 
     def retire_profile_copy(self, name: str, profile: str, rel: str, expected: str | None) -> str | None:
@@ -248,7 +250,9 @@ class Operation:
         def action():
             move_noreplace(src, dst)
 
-        self._act(op, {"name": name, "src": str(src), "dst": str(dst), "fingerprint": path_sha256(src)}, action)
+        self._act(
+            op, {"name": name, "src": str(src), "dst": str(dst), "fingerprint": path_sha256(src)}, action
+        )
 
     def copy_in(self, op: str, name: str, src: Path, dst: Path, **extra: Any) -> dict[str, Any]:
         """copy_noreplace(src, dst), journaled as *op* (shared_copy or profile_copy)."""

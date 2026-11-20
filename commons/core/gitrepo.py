@@ -354,7 +354,14 @@ class GitRepo:
         """
         spec = literal(self._relative(Path(path)))
         out = self._run(
-            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", spec, *_EXCLUDE_PATHSPECS, read_only=True
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            spec,
+            *_EXCLUDE_PATHSPECS,
+            read_only=True,
         ).stdout
         fields = out.split("\0")
         paths: list[str] = []
@@ -406,7 +413,9 @@ class GitRepo:
             if rels and self._has_head():
                 self._run("reset", "-q", "--", *[f":(top,literal){r}" for r in rels], check=False)
             elif rels:
-                self._run("rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", *map(literal, rels), check=False)
+                self._run(
+                    "rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", *map(literal, rels), check=False
+                )
             self._run("add", "-A", "--", ".", *specs)
             if self._run("diff", "--cached", "--quiet", check=False).returncode == 0:
                 return None

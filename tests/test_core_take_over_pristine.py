@@ -58,9 +58,10 @@ def test_keep_choice_on_classic_fleet_retires_pristine_copies_and_verifies_clean
         assert not (_skills(root, p) / "bundled" / "bundled-edited").exists(), p
         assert (_skills(root, p) / "bundled" / "bundled-pristine").is_dir(), p  # all-pristine: stays
     _shared_wins(root, lay, "bundled-edited")
-    assert {("bundled-edited", "default", "bundled-pristine"), ("bundled-edited", "device", "bundled-pristine")} <= (
-        _taken(lay)
-    )
+    assert {
+        ("bundled-edited", "default", "bundled-pristine"),
+        ("bundled-edited", "device", "bundled-pristine"),
+    } <= (_taken(lay))
     assert verify(before_names, discover(root), lay, dir_hash_md5, hub_content_hash) == []
     plan = plan_restore(lay, result.backup_id)
     out = restore(plan, discover(root), YamlFileWriter(), now=LATER)
@@ -86,9 +87,13 @@ def test_setup_move_retires_pristine_copies_and_check_tracks_them(tmp_path):
     assert result.error is None, result.error
     lay = layout_for(root)
     _shared_wins(root, lay, "mixed")
-    assert {("mixed", p, k) for p, k in [("default", "bundled-pristine"), ("pikvm", "bundled-edited")]} <= _taken(lay)
+    assert {
+        ("mixed", p, k) for p, k in [("default", "bundled-pristine"), ("pikvm", "bundled-edited")]
+    } <= _taken(lay)
     assert verify(before_names, discover(root), lay, dir_hash_md5, hub_content_hash) == []
-    newer = [f for f in run_check(discover(root), lay, bundled_index={"mixed": "md5:new"}) if f.skill == "mixed"]
+    newer = [
+        f for f in run_check(discover(root), lay, bundled_index={"mixed": "md5:new"}) if f.skill == "mixed"
+    ]
     assert newer and all(f.code == "upstream-newer" for f in newer)
 
 
@@ -146,13 +151,19 @@ def test_promote_retires_pristine_copies_in_profiles_that_read_the_shared_root(c
     # bundled-pristine stayed local everywhere; pocket edits its copy and promotes it.
     md = _skills(root, "pocket") / "bundled" / "bundled-pristine" / "SKILL.md"
     md.write_text(md.read_text(encoding="utf-8") + "pocket edit\n", encoding="utf-8")
-    res = promote("bundled-pristine", "pocket", lay, discover(root), dir_hash_md5, hub_content_hash, now=LATER)
+    res = promote(
+        "bundled-pristine", "pocket", lay, discover(root), dir_hash_md5, hub_content_hash, now=LATER
+    )
     for p in PROFILES:
         assert not (_skills(root, p) / "bundled" / "bundled-pristine").exists(), p
     _shared_wins(root, lay, "bundled-pristine")
     kinds = {p: k for n, p, k in _taken(lay) if n == "bundled-pristine"}
-    assert kinds == {"pocket": "bundled-edited", "default": "bundled-pristine", "device": "bundled-pristine",
-                     "pikvm": "bundled-pristine"}
+    assert kinds == {
+        "pocket": "bundled-edited",
+        "default": "bundled-pristine",
+        "device": "bundled-pristine",
+        "pikvm": "bundled-pristine",
+    }
     assert res.kept == []
 
 

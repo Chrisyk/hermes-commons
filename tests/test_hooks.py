@@ -365,4 +365,6 @@ def test_hook_does_not_commit_while_a_journal_is_unfinished(wired, caplog):
         assert wired["worker"].flush(10)
     assert len(wired["repo"].log()) == 1
     assert wired["repo"].status_porcelain() != []
-    assert any("did not finish" in r.getMessage() and "not committed" in r.getMessage() for r in caplog.records)
+    assert any(
+        "did not finish" in r.getMessage() and "not committed" in r.getMessage() for r in caplog.records
+    )

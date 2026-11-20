@@ -474,7 +474,9 @@ def validate_staged(task: MergeTask) -> MergeCheck:
                 check.lost_files.append(LostFile(v.profile, f.rel))
                 continue
             if f.kind != "dir" and f.rel not in staged_rels:
-                what = {"link": "symlink", "binary": "file"}.get(f.kind, "empty file" if not f.lines else "file")
+                what = {"link": "symlink", "binary": "file"}.get(
+                    f.kind, "empty file" if not f.lines else "file"
+                )
                 check.notes.append(f"{v.profile}:{v.rel}/{f.rel} ({what}) is not in staging under that name")
     check.staged_hash = tree_sha256(staging)
     return check

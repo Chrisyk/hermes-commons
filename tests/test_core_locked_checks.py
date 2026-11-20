@@ -119,7 +119,10 @@ def test_retire_shared_rechecks_the_fingerprint_before_moving(classic_fleet):
     shared = next(v for v in task.variants if v.profile == "shared")
     src = task.shared_root / task.target_rel
     (src / "SKILL.md").write_text("changed under us\n", encoding="utf-8")
-    with pytest.raises(JournalError, match="changed"), operation(task.layout, [], "merge-x", "merge", LATER) as op:
+    with (
+        pytest.raises(JournalError, match="changed"),
+        operation(task.layout, [], "merge-x", "merge", LATER) as op,
+    ):
         op.retire_shared(task.name, task.target_rel, expected=shared.fingerprint)
     assert (src / "SKILL.md").read_text(encoding="utf-8") == "changed under us\n"
 
