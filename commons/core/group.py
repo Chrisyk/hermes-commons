@@ -20,6 +20,14 @@ accepted normalizations, for containment only, are those of _text_lines:
 - trailing spaces, tabs and CRs stripped from each line;
 - in SKILL.md, frontmatter version:, updated: and last_updated: lines ignored.
 
+Executable bits: two copies whose content views are equal apart from
+executable bits are a special case of containment. The copy whose set of
+executable files is a superset of the other's contains it and is kept (a
+script that is executable in one profile and 0644 in another is the same
+script; keeping the executable one loses nothing). If neither set contains
+the other, it is a conflict. Copies that differ in content as well must
+agree on every executable bit to be contained (see _contained).
+
 Whether a non-empty text file ends with a newline is NOT normalized: copies
 that differ in it are neither contained nor identical. 'identical' compares
 raw bytes and so accepts no normalization at all. merge --accept and the
@@ -35,7 +43,7 @@ import re
 import stat
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -317,6 +325,24 @@ def _contained(a: dict[str, _File], b: dict[str, _File]) -> bool:
     return all(rel in b and _file_contained(f, b[rel]) for rel, f in a.items())
 
 
+def _without_exec(content: dict[str, _File]) -> dict[str, _File]:
+    return {rel: replace(f, executable=False) for rel, f in content.items()}
+
+
+def _executables(content: dict[str, _File]) -> set[str]:
+    return {rel for rel, f in content.items() if f.executable}
+
+
+def _exec_contained(a: dict[str, _File], b: dict[str, _File]) -> bool:
+    """True when *a* and *b* are equal apart from executable bits and b's executables include a's."""
+    return _without_exec(a) == _without_exec(b) and _executables(a) <= _executables(b)
+
+
+def _contains(a: dict[str, _File], b: dict[str, _File]) -> bool:
+    """Grouping's containment: _contained, or equal content views that differ only in executable bits."""
+    return _contained(a, b) or _exec_contained(a, b)
+
+
 def _size(content: dict[str, _File]) -> tuple[int, int]:
     return (sum(len(f.lines) for f in content.values()), len(content))
 
@@ -415,7 +441,7 @@ def _decide(name: str, copies: list[SkillCopy]) -> Group:
     pending = sorted(movable, key=lambda c: (_size(contents[c.id]), -rank[c.id]))
     survivors = list(movable)
     for a in pending:
-        if any(b is not a and _contained(contents[a.id], contents[b.id]) for b in survivors):
+        if any(b is not a and _contains(contents[a.id], contents[b.id]) for b in survivors):
             survivors.remove(a)
     if len(survivors) == 1:
         result.status = "contained"
@@ -439,7 +465,8 @@ def group(copies: Iterable[SkillCopy]) -> list[Group]:
     hash and one exact content view (bytes, executable bits, excluded dirs
     such as .git included) -> identical (keep the first copy in profile
     order); one copy left
-    after dropping every copy contained in another (see _contained) ->
+    after dropping every copy contained in another (see _contained, and the
+    executable-bit rule in the module docstring) ->
     contained (keep it); otherwise conflict, with per surviving copy the count
     of lines no other survivor has in the same file (multiset) and the files
     no other survivor has.

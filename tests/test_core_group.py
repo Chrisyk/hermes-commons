@@ -489,7 +489,8 @@ def test_executable_bit_difference_breaks_identical(fleet):
     root, g = _pair(fleet, dict(files), dict(files))
     assert g.status == "identical"
     os.chmod(root / "profiles/device/skills/t/x/scripts/run.sh", 0o755)
-    assert _groups(root)["x"].status == "conflict"
+    g = _groups(root)["x"]
+    assert g.status == "contained" and g.keep.profile == "device"  # not identical; the 755 copy is kept
 
 
 def test_inner_symlink_targets_must_match(fleet):
@@ -605,3 +606,51 @@ def test_compare_variants(classic_fleet):
     g = _groups(classic_fleet)["conflict"]
     stats = compare_variants(g.copies)
     assert {cid: n for cid, (n, _) in stats.items()} == g.unique_lines
+
+
+# ------------------------------------------------------------------ executable bits only
+
+
+def test_exec_bit_superset_contains_the_other(fleet):
+    files = {"SKILL.md": _MD, "scripts/run.sh": "echo run\n", "scripts/b.sh": "echo b\n"}
+    root, _ = _pair(fleet, dict(files), dict(files))
+    os.chmod(root / "skills/t/x/scripts/run.sh", 0o755)  # default 755, device 644 (Phase 6)
+    os.chmod(root / "skills/t/x/scripts/b.sh", 0o755)
+    os.chmod(root / "profiles/device/skills/t/x/scripts/b.sh", 0o755)
+    g = _groups(root)["x"]
+    assert g.status == "contained" and g.keep.profile == "default"
+    # the superset wins whichever profile holds it
+    os.chmod(root / "skills/t/x/scripts/run.sh", 0o644)
+    os.chmod(root / "profiles/device/skills/t/x/scripts/run.sh", 0o755)
+    g = _groups(root)["x"]
+    assert g.status == "contained" and g.keep.profile == "device"
+
+
+def test_exec_bits_neither_superset_is_conflict(fleet):
+    files = {"SKILL.md": _MD, "scripts/a.sh": "echo a\n", "scripts/b.sh": "echo b\n"}
+    root, _ = _pair(fleet, dict(files), dict(files))
+    os.chmod(root / "skills/t/x/scripts/a.sh", 0o755)
+    os.chmod(root / "profiles/device/skills/t/x/scripts/b.sh", 0o755)
+    assert _groups(root)["x"].status == "conflict"
+
+
+def test_exec_bit_rule_needs_equal_content(fleet):
+    a = {"SKILL.md": _MD, "scripts/run.sh": "echo run\n"}
+    b = {"SKILL.md": _MD, "scripts/run.sh": "echo run\necho more\n"}
+    root, _ = _pair(fleet, a, b)
+    os.chmod(root / "skills/t/x/scripts/run.sh", 0o755)  # bigger copy is not executable
+    assert _groups(root)["x"].status == "conflict"
+
+
+def test_exec_bit_superset_moves_in_setup(fleet):
+    from commons.core.layout import Layout
+    from commons.core.proposal import build_proposal
+
+    files = {"SKILL.md": _MD, "scripts/run.sh": "echo run\n"}
+    root, _ = _pair(fleet, dict(files), dict(files))
+    os.chmod(root / "skills/t/x/scripts/run.sh", 0o755)
+    lay = Layout(root / "shared", root / "commons")
+    prop = build_proposal(discover(root), lay, dir_hash_md5, hub_content_hash, {}, home=root)
+    (m,) = [m for m in prop.moves if m.name == "x"]
+    assert m.source_profile == "default"
+    assert sorted(m.retire) == [("default", "t/x"), ("device", "t/x")]
