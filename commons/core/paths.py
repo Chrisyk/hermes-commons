@@ -203,10 +203,11 @@ def find_stale_paths(
     for profile in sorted(cron_jobs):
         if profile not in names:
             continue
-        for job in cron_jobs[profile]:
+        keys = job_keys(cron_jobs[profile])
+        for index, job in enumerate(cron_jobs[profile]):
             if not isinstance(job, dict):
                 continue
-            job_id = str(job.get("id"))
+            job_id = keys[index]
             for field in PROMPT_FIELDS:
                 value = job.get(field)
                 if not isinstance(value, str):
@@ -222,6 +223,27 @@ def find_stale_paths(
             for old, new, new_abs in _matches(text, forms, home):
                 add(Finding("skill-file", str(md), old, new, exists(new_abs), path=md))
     return out
+
+
+def job_keys(jobs: list) -> list[str]:
+    """A key per job: its id when that is a non-empty string or int unique in the list, else '#<index>'.
+
+    Jobs without a usable id are named by position; rewrite() re-checks that
+    the job at that position still has no usable id, and skips it otherwise
+    (the list changed: which job is meant is ambiguous).
+    """
+    ids = [
+        str(j["id"]) if isinstance(j, dict) and isinstance(j.get("id"), (str, int)) and str(j["id"]) else None
+        for j in jobs
+    ]
+    counts: dict[str, int] = {}
+    for i in ids:
+        if i is not None:
+            counts[i] = counts.get(i, 0) + 1
+    return [
+        i if i is not None and counts[i] == 1 and not i.startswith("#") else f"#{n}"
+        for n, i in enumerate(ids)
+    ]
 
 
 def _fsync_dir(path: Path) -> None:
@@ -361,9 +383,11 @@ def _rewrite_cron(path: Path, findings: list[Finding], backup: Path) -> tuple[li
             by_job.setdefault((str(f.job_id), str(f.field)), []).append(f)
         done: list[Finding] = []
         missing: list[Finding] = []
-        for job in jobs:
+        for job, key in zip(jobs, job_keys(jobs), strict=True):
+            if not isinstance(job, dict):
+                continue
             for field in PROMPT_FIELDS:
-                todo = by_job.pop((str(job.get("id")), field), [])
+                todo = by_job.pop((key, field), [])
                 if todo and isinstance(job.get(field), str):
                     job[field], d, m = _replace_all(job[field], todo)
                     done += d

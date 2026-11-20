@@ -120,6 +120,7 @@ def test_crash_after_commit(classic_fleet, monkeypatch):
 
 class SetThenCrash(YamlFileWriter):
     def __init__(self, profile: str):
+        super().__init__()
         self.profile = profile
 
     def set(self, profile, key, value):

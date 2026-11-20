@@ -1,10 +1,19 @@
 """Reading and writing one key of a profile's config.yaml.
 
-ConfigWriter is the interface setup and restore use. YamlFileWriter edits the
-file directly (load, change a dotted key, atomic dump) and is what tests use.
-The real fleet goes through `hermes config set` (HermesCliWriter, wired in the
-adapter phase) because it keeps comments and formatting; this module only
-defines that command's argv as a pure function and never runs Hermes.
+ConfigWriter is the interface setup and restore use. The real fleet goes
+through `hermes config set` (HermesCliWriter, wired in the adapter phase);
+this module only defines that command's argv as a pure function and never
+runs Hermes. YamlFileWriter edits the file directly and is what tests (and
+a fallback) use.
+
+`hermes config set` keeps comments, key order and quoting (a ruamel
+round-trip, utils.atomic_roundtrip_yaml_update), and YamlFileWriter matches
+that for the keys commons writes: it edits only the lines of the key with
+the line editor in yamledit.py, checks that the edited file parses to
+exactly the intended data, and only otherwise (flow-style parent, unusual
+layout) falls back to a full yaml.safe_dump, which drops comments. Each
+write returns 'edited', 'rewritten' (the fallback) or 'unchanged', and the
+writer lists its fallbacks in .fallbacks so a caller can warn.
 Stdlib + PyYAML.
 """
 
@@ -14,12 +23,14 @@ import contextlib
 import os
 import stat
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import yaml
 
 from commons.core.fleet import CONFIG_FILE, DEFAULT_PROFILE, Profile
+from commons.core.yamledit import Lines, Unsupported
 
 
 class ConfigError(ValueError):
@@ -152,18 +163,30 @@ def hermes_config_unset_argv(profile_name: str, key: str) -> list[str]:
     return argv
 
 
+Outcome = Literal["edited", "rewritten", "unchanged"]
+
+
 class YamlFileWriter:
-    """Edit <profile.home>/config.yaml in place. Comments are not preserved."""
+    """Edit <profile.home>/config.yaml in place, keeping comments and order (see module docstring)."""
+
+    def __init__(self) -> None:
+        self.fallbacks: list[tuple[Path, str, str]] = []  # (config path, key, why) of full rewrites
 
     def _path(self, profile: Profile) -> Path:
         return profile.home / CONFIG_FILE
 
-    def _load(self, profile: Profile) -> dict:
-        path = self._path(profile)
+    def _text(self, profile: Profile) -> str | None:
+        """The file as text, line endings kept (no universal-newline translation), BOM dropped."""
         try:
-            text = path.read_text(encoding="utf-8-sig")
+            return self._path(profile).read_bytes().decode("utf-8-sig")
         except FileNotFoundError:
-            return {}
+            return None
+
+    def _load(self, profile: Profile) -> dict:
+        text = self._text(profile)
+        return {} if text is None else self._parse(self._path(profile), text)
+
+    def _parse(self, path: Path, text: str) -> dict:
         try:
             data = yaml.safe_load(text)
         except yaml.YAMLError as exc:
@@ -174,7 +197,39 @@ class YamlFileWriter:
             raise ConfigError(f"{path} is not a mapping; refusing to rewrite it")
         return data
 
+    def _edit(
+        self, profile: Profile, key: str, data: dict, edit: Callable[[Lines, str, str], None]
+    ) -> Outcome:
+        """Write *data*, the intended config: by edit() on the lines when that yields exactly it, else a dump."""
+        path = self._path(profile)
+        text = self._text(profile)
+        bom = text is not None and path.read_bytes().startswith(b"\xef\xbb\xbf")
+        try:
+            parts = _parts(key)
+            if len(parts) != 2:
+                raise Unsupported("only two-level keys are edited in place")
+            lines = Lines(text or "")
+            edit(lines, *parts)
+            new = lines.text()
+            try:
+                same = self._parse(path, new) == data
+            except ConfigError:
+                same = False
+            if not same:
+                raise Unsupported("the edited lines would not hold the intended value")
+        except Unsupported as exc:
+            self.fallbacks.append((path, key, str(exc)))
+            self._save(profile, data)
+            return "rewritten"
+        self._write(profile, ("\ufeff" if bom else "") + new)
+        return "edited"
+
     def _save(self, profile: Profile, data: dict) -> None:
+        self._write(
+            profile, yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
+        )
+
+    def _write(self, profile: Profile, content: str) -> None:
         # Write through a symlinked config.yaml so the link itself survives.
         path = self._path(profile).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,8 +239,8 @@ class YamlFileWriter:
             mode = 0o600  # a new config may hold API keys: owner only
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                yaml.safe_dump(data, fh, sort_keys=False, allow_unicode=True, default_flow_style=False)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(content)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.chmod(tmp, mode)
@@ -204,10 +259,14 @@ class YamlFileWriter:
     def get(self, profile: Profile, key: str) -> Any:
         return _lookup(self._load(profile), _parts(key))
 
-    def set(self, profile: Profile, key: str, value: Any) -> None:
+    def set(self, profile: Profile, key: str, value: Any) -> Outcome:
         data = self._load(profile)
+        if has_key(data, key) and _lookup(data, _parts(key)) == value:
+            return "unchanged"
         _assign(data, key, value)
-        self._save(profile, data)
+        if isinstance(value, list):
+            return self._edit(profile, key, data, lambda lines, top, sub: lines.set_list(top, sub, value))
+        return self._edit(profile, key, data, lambda lines, top, sub: lines.set_scalar(top, sub, value))
 
     def _list(self, data: dict, key: str) -> list | None:
         current = _lookup(data, _parts(key))
@@ -215,23 +274,26 @@ class YamlFileWriter:
             raise ConfigError(f"config key {key!r} is not a list")
         return current
 
-    def add_to_list(self, profile: Profile, key: str, item: Any) -> None:
+    def add_to_list(self, profile: Profile, key: str, item: Any) -> Outcome:
         data = self._load(profile)
         current = self._list(data, key)
         if current is not None and item in current:
-            return
-        _assign(data, key, [*(current or []), item])
-        self._save(profile, data)
+            return "unchanged"
+        items = [*(current or []), item]
+        _assign(data, key, items)
+        return self._edit(profile, key, data, lambda lines, top, sub: lines.set_list(top, sub, items))
 
-    def remove_from_list(self, profile: Profile, key: str, item: Any) -> None:
+    def remove_from_list(self, profile: Profile, key: str, item: Any) -> Outcome:
         data = self._load(profile)
         current = self._list(data, key)
         if not current or item not in current:
-            return
-        _assign(data, key, [x for x in current if x != item])
-        self._save(profile, data)
+            return "unchanged"
+        items = [x for x in current if x != item]
+        _assign(data, key, items)
+        return self._edit(profile, key, data, lambda lines, top, sub: lines.set_list(top, sub, items))
 
-    def unset(self, profile: Profile, key: str) -> None:
+    def unset(self, profile: Profile, key: str) -> Outcome:
         data = self._load(profile)
-        if _remove(data, _parts(key)):
-            self._save(profile, data)
+        if not _remove(data, _parts(key)):
+            return "unchanged"
+        return self._edit(profile, key, data, lambda lines, top, sub: lines.unset(top, sub))
