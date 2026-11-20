@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 
 import pytest
+import yaml
 
 from commons.core import apply as apply_mod
 from commons.core.apply import apply, intents, load_journal, load_setup_proposal, unfinished_setups
@@ -13,11 +16,11 @@ from commons.core.backup import tree_sha256
 from commons.core.configio import YamlFileWriter
 from commons.core.fleet import discover
 from commons.core.gitrepo import GitRepo
-from commons.core.restore import plan_restore, restore
+from commons.core.restore import REPORT_KEYS_ONLY, plan_restore, restore
 from tests.conftest import PROFILES
 from tests.fleet import profile_home
 from tests.test_core_apply import NOW, layout_for, propose
-from tests.test_core_crash import Crash, after_nth, state
+from tests.test_core_crash import Crash, SetThenCrash, add_cron, after_nth, state
 from tests.test_core_restore import LATER
 
 
@@ -188,3 +191,86 @@ def test_resume_wrong_proposal_or_finished_is_refused(classic_fleet, monkeypatch
     assert r.error is None
     r = apply(prop, discover(root), layout_for(root), YamlFileWriter(), NOW, resume=bid)
     assert r.error and "already finished" in r.error
+
+
+def test_cron_edit_between_crash_and_resume_is_kept(classic_fleet, monkeypatch):
+    """A pending cron_write whose file changed is superseded: restore uses a fresh backup."""
+    root = classic_fleet
+    add_cron(root, ("pikvm",))
+    after_nth(monkeypatch, apply_mod._RewriteHook, "before", 1)
+    with pytest.raises(Crash):
+        apply(propose(root), discover(root), layout_for(root), YamlFileWriter(), NOW, home=root)
+    monkeypatch.undo()
+    (bid,) = os.listdir(layout_for(root).backups_dir)
+    jobs = profile_home(root, "pikvm") / "cron" / "jobs.json"
+    data = json.loads(jobs.read_text(encoding="utf-8"))
+    data["jobs"].append({"id": "new", "prompt": "hi"})
+    jobs.write_text(json.dumps(data), encoding="utf-8")
+    edited = jobs.read_bytes()
+    prop = load_setup_proposal(layout_for(root), bid)
+    r = apply(prop, discover(root), layout_for(root), YamlFileWriter(), NOW, home=root, resume=bid)
+    assert r.error is None, r.error
+    old, new = intents(load_journal(layout_for(root), bid), "cron_write")
+    assert old["state"] == "superseded" and "changed" in old["args"]["superseded"]
+    assert new["state"] == "done" and new["args"]["sha_before"] == hashlib.sha256(edited).hexdigest()
+    assert new["args"]["backup_copy"] != old["args"]["backup_copy"]
+    assert Path(new["args"]["backup_copy"]).read_bytes() == edited
+    res = restore(plan_restore(layout_for(root), bid), discover(root), YamlFileWriter(), now=LATER)
+    assert jobs.read_bytes() == edited, res.reports
+
+
+def test_config_edit_between_crash_and_resume_is_kept(classic_fleet, monkeypatch):
+    root = classic_fleet
+    bid = crash_partial_copy(root, monkeypatch)
+    cfg = profile_home(root, "pikvm") / "config.yaml"
+    cfg.write_text(cfg.read_text(encoding="utf-8") + "model: user-picked\n", encoding="utf-8")
+    prop = load_setup_proposal(layout_for(root), bid)
+    r = apply(prop, discover(root), layout_for(root), YamlFileWriter(), NOW, home=root, resume=bid)
+    assert r.error is None
+    journal = load_journal(layout_for(root), bid)
+    assert journal["profiles"]["pikvm"]["config_changed_externally"]
+    assert "config_changed_externally" not in journal["profiles"]["default"]
+    res = restore(plan_restore(layout_for(root), bid), discover(root), YamlFileWriter(), now=LATER)
+    after = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+    assert after["model"] == "user-picked", res.reports
+    assert "commons" not in (after.get("plugins") or {}).get("enabled", [])
+    assert after.get("skills", {}).get("create_dir") != str(root / "shared")
+    assert any(r.startswith(f"pikvm: {REPORT_KEYS_ONLY}") for r in res.reports)
+
+
+def test_config_edit_after_crash_mid_config_is_kept(classic_fleet):
+    root = classic_fleet
+    with pytest.raises(Crash):
+        apply(propose(root), discover(root), layout_for(root), SetThenCrash("pikvm"), NOW, home=root)
+    (bid,) = os.listdir(layout_for(root).backups_dir)
+    cfg = profile_home(root, "pikvm") / "config.yaml"
+    cfg.write_text(cfg.read_text(encoding="utf-8") + "model: user-picked\n", encoding="utf-8")
+    prop = load_setup_proposal(layout_for(root), bid)
+    r = apply(prop, discover(root), layout_for(root), YamlFileWriter(), NOW, home=root, resume=bid)
+    assert r.error is None
+    assert load_journal(layout_for(root), bid)["profiles"]["pikvm"]["config_changed_externally"]
+    res = restore(plan_restore(layout_for(root), bid), discover(root), YamlFileWriter(), now=LATER)
+    assert yaml.safe_load(cfg.read_text(encoding="utf-8"))["model"] == "user-picked", res.reports
+
+
+def test_partial_set_aside_is_journaled_and_reported(classic_fleet, monkeypatch):
+    root = classic_fleet
+    bid = crash_partial_copy(root, monkeypatch)
+    order = []
+    real = apply_mod.move_noreplace
+
+    def spy(src, dst):
+        journal = load_journal(layout_for(root), bid)
+        order.append([i["state"] for i in intents(journal, "partial_set_aside")])
+        return real(src, dst)
+
+    monkeypatch.setattr(apply_mod, "move_noreplace", spy)
+    prop = load_setup_proposal(layout_for(root), bid)
+    r = apply(prop, discover(root), layout_for(root), YamlFileWriter(), NOW, home=root, resume=bid)
+    monkeypatch.undo()
+    assert r.error is None
+    assert order == [["pending"]]  # journaled before the move
+    (aside,) = intents(load_journal(layout_for(root), bid), "partial_set_aside")
+    assert aside["state"] == "done" and Path(aside["args"]["dst"]).exists()
+    res = restore(plan_restore(layout_for(root), bid), discover(root), YamlFileWriter(), now=LATER)
+    assert any("set aside" in x and aside["args"]["dst"] in x for x in res.reports), res.reports

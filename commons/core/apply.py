@@ -41,6 +41,19 @@ Intent args (all paths absolute strings):
   cron_write {profile, path, backup_copy, sha_before, sha_after}
   md_write {path, backup_copy, sha_before, sha_after}
   config_json {path, sha_before}, done adds sha_after
+  partial_set_aside {target_rel, src, dst}  a partial copy moved into <backup>/partial/
+
+A cron_write or md_write left pending whose file no longer holds sha_before
+when the run resumes (someone edited it in between) is marked 'superseded'
+(args.superseded says why) and a new intent is started, with a fresh copy of
+the file as it is now as its backup_copy; restore only uses the newest
+intent that is not superseded for each file. A backup_copy always holds the
+bytes of its intent's sha_before.
+
+When the config phase runs (fresh or resumed) and a profile's config.yaml
+is neither as it was before setup nor as commons' own config changes left
+it, profiles.<name>.config_changed_externally records that, and restore
+reverts only commons' keys in it (never a byte restore).
 
 A resumed apply (apply(..., resume=<backup id>)) reuses that backup,
 its journal and the proposal saved with it (backups/<id>/proposal.json,
@@ -48,7 +61,7 @@ load_setup_proposal): phases listed in 'steps' are skipped, done intents are ski
 and each pending intent is checked against the file system first (done
 when its effect is there, redone when it is not). A pending copy whose
 target exists is moved into backups/<id>/partial/ (never deleted) and
-copied again. Without resume, apply refuses while any setup journal is
+copied again (op partial_set_aside, journaled before the move). Without resume, apply refuses while any setup journal is
 neither complete nor restored.
 
 Other journal keys: version, proposal_sha256, names_before, resumed, backup_id, created, shared_root, state_dir,
@@ -59,9 +72,11 @@ git {initialized, snapshot_sha, base_sha, final_sha}. Stdlib + PyYAML only.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import os
+import shutil
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -76,7 +91,7 @@ from commons.core.backup import (
     tree_sha256,
     write_json_atomic,
 )
-from commons.core.configio import ConfigWriter, has_key
+from commons.core.configio import ConfigWriter, has_key, lookup_key, set_key
 from commons.core.fleet import CONFIG_FILE, Profile, load_config
 from commons.core.gitrepo import GitRepo
 from commons.core.group import fingerprint, same_content
@@ -104,6 +119,8 @@ REWRITE_MESSAGE = "commons: rewrite stale skill paths"
 CONFIG_MESSAGE = "commons: record setup"
 PENDING = "pending"
 DONE = "done"
+SUPERSEDED = "superseded"
+CONFIG_OPS = ("config_set", "config_list_add")
 
 
 class ApplyError(RuntimeError):
@@ -211,6 +228,32 @@ def load_journal(layout: Layout, backup_id: str) -> dict[str, Any]:
 def intents(journal: Mapping[str, Any], op: str | None = None) -> list[dict[str, Any]]:
     """The journal's intents, optionally only those of one op, in the order they were written."""
     return [i for i in journal.get("intents", []) if op is None or i["op"] == op]
+
+
+def newest_writes(journal: Mapping[str, Any], op: str) -> list[dict[str, Any]]:
+    """The newest *op* (cron_write/md_write) intent per file, superseded ones left out, in order."""
+    newest: dict[str, dict[str, Any]] = {}
+    for i in intents(journal, op):
+        if i["state"] != SUPERSEDED:
+            newest[i["args"]["path"]] = i
+    return list(newest.values())
+
+
+def config_states(base: dict, config_intents: Iterable[Mapping[str, Any]]) -> list[dict]:
+    """The parsed config after 0, 1, ... n of the journaled config changes, applied as data."""
+    states = [copy.deepcopy(base)]
+    data = copy.deepcopy(base)
+    for i in config_intents:
+        args = i["args"]
+        if i["op"] == "config_set":
+            set_key(data, args["key"], args["new_value"])
+        elif not args.get("was_present"):
+            current = lookup_key(data, args["key"])
+            items = list(current) if isinstance(current, list) else []
+            if args["item"] not in items:
+                set_key(data, args["key"], [*items, args["item"]])
+        states.append(copy.deepcopy(data))
+    return states
 
 
 def _stamp(now: datetime) -> str:
@@ -359,12 +402,30 @@ def apply(
 class _RewriteHook:
     """paths.rewrite WriteHook: journal each cron/markdown write ahead of it.
 
-    A pending intent for the same file (from an interrupted run) is reused.
+    A pending intent for the same file (from an interrupted run) is reused
+    while the file still holds its sha_before; when it does not (edited
+    since), that intent is superseded and a new one, with a fresh backup of
+    the file as it is now, is started.
     """
 
     def __init__(self, journal: _Journal):
         self.journal = journal
         self.entry: dict[str, Any] | None = None
+
+    @staticmethod
+    def _backup_for(write: PlannedWrite) -> Path:
+        """write.backup when it holds the bytes of sha_before, else a fresh copy beside it."""
+        if file_sha256(write.backup) == write.sha_before:
+            return write.backup
+        fresh = _next_free(write.backup)
+        fresh.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(write.path, fresh)
+        with open(fresh, "rb") as fh:
+            os.fsync(fh.fileno())
+        _fsync_dir(fresh.parent)
+        if file_sha256(fresh) != write.sha_before:
+            raise ApplyError(f"{write.path} changed while it was being backed up; not rewritten")
+        return fresh
 
     def before(self, write: PlannedWrite) -> None:
         op = "cron_write" if write.kind == "cron" else "md_write"
@@ -378,12 +439,20 @@ class _RewriteHook:
             args = {"profile": write.profile, **args}
         entry = self.journal.find(op, path=str(write.path))
         if entry is not None and entry["state"] == PENDING:
-            # Keep the original sha_before: backup_copy still holds that version.
-            entry["args"]["sha_after"] = write.sha_after
+            if entry["args"]["sha_before"] == write.sha_before:
+                # Unchanged since the interrupted run: its backup_copy still holds this version.
+                entry["args"]["sha_after"] = write.sha_after
+                self.journal.save()
+                self.entry = entry
+                return
+            entry["state"] = SUPERSEDED
+            entry["args"]["superseded"] = (
+                f"{write.path} changed between the interrupted run and the resume "
+                f"(sha256 {write.sha_before}, not {entry['args']['sha_before']}); a new intent took over"
+            )
             self.journal.save()
-            self.entry = entry
-        else:
-            self.entry = self.journal.begin(op, args)
+        args["backup_copy"] = str(self._backup_for(write))
+        self.entry = self.journal.begin(op, args)
 
     def after(self, write: PlannedWrite) -> None:
         assert self.entry is not None
@@ -646,14 +715,15 @@ class _Run:
             self.journal.done(entry)
 
     def _set_aside(self, entry: dict[str, Any] | None, dst: Path, backup_dir: Path, rel: str) -> None:
-        """Move a partial copy into <backup>/partial/ (never deleted) and note it."""
+        """Move a partial copy into <backup>/partial/ (never deleted), journaled ahead (partial_set_aside)."""
         aside = _next_free(backup_dir / PARTIAL / rel)
+        note = self.journal.begin(
+            "partial_set_aside", {"target_rel": rel, "src": str(dst), "dst": str(aside)}
+        )
         move_noreplace(dst, aside)
         if entry is not None:
             entry["args"].setdefault("partial", []).append(str(aside))
-        else:
-            self.journal.data.setdefault("partials_set_aside", []).append(str(aside))
-        self.journal.save()
+        self.journal.done(note)
 
     def phase_commit(self) -> None:
         targets = [
@@ -662,15 +732,52 @@ class _Run:
         if targets:
             self.commit("setup", f"commons setup {self.journal.data['created']}", targets)
 
+    def _config_as_commons_left_it(self, name: str, config_file: Path) -> bool:
+        """True when config.yaml is as before setup, or holds only commons' own journaled changes."""
+        rec = self.journal.data["profiles"][name]
+        mine = [
+            i for i in self.journal.data["intents"] if i["op"] in CONFIG_OPS and i["args"]["profile"] == name
+        ]
+        current = file_sha256(config_file)
+        wrote = {i["args"].get("config_sha256_after") for i in mine if i["state"] == DONE}
+        if current == rec["config_before_sha256"] or current in wrote - {None}:
+            return True
+        if current is None or not any(i["state"] == PENDING for i in mine):
+            return False
+        # A crash right after a config write, before its sha was journaled: compare the data.
+        base = load_config(self.backup_dir / name / CONFIG_FILE) if rec["config_before_sha256"] else {}
+        return load_config(config_file) in config_states(base, mine)
+
+    def _check_config(self, name: str, config_file: Path) -> bool:
+        """Record config_changed_externally for *name* when needed; True when it is (or was) recorded."""
+        rec = self.journal.data["profiles"][name]
+        if not rec.get("config_changed_externally") and not self._config_as_commons_left_it(
+            name, config_file
+        ):
+            rec["config_changed_externally"] = {
+                "at": _stamp(self.now),
+                "sha256": file_sha256(config_file),
+                "why": "config.yaml changed outside commons during setup; restore reverts commons keys only",
+            }
+            self.journal.save()
+        return bool(rec.get("config_changed_externally"))
+
     def phase_config(self) -> None:
         shared = str(self.layout.shared_root)
         writer = self.writer
         for p in self.profiles:
             changes = {c.key for c in self.prop.config_changes.get(p.name, [])}
             config_file = p.home / CONFIG_FILE
+            external = self._check_config(p.name, config_file)
 
             def after(entry, p=p, config_file=config_file):
                 return {"config_sha256_after": file_sha256(config_file)}
+
+            def settled(args, ok, config_file=config_file, external=external) -> bool:
+                """happened() for a pending config intent: note commons' sha when nobody else wrote."""
+                if ok and not external:
+                    args["config_sha256_after"] = file_sha256(config_file)
+                return ok
 
             if CREATE_DIR_KEY in changes:
                 key = {"profile": p.name, "key": CREATE_DIR_KEY}
@@ -687,7 +794,11 @@ class _Run:
                     return after(entry)
 
                 self.act(
-                    "config_set", key, args, set_it, lambda a, p=p: writer.get(p, CREATE_DIR_KEY) == shared
+                    "config_set",
+                    key,
+                    args,
+                    set_it,
+                    lambda a, p=p, settled=settled: settled(a, writer.get(p, CREATE_DIR_KEY) == shared),
                 )
             if PLUGINS_KEY in changes:
                 key = {"profile": p.name, "key": PLUGINS_KEY, "item": PLUGIN}
@@ -705,7 +816,11 @@ class _Run:
                     return after(entry)
 
                 self.act(
-                    "config_list_add", key, {"was_present": False}, add_it, lambda a, listed=listed: listed()
+                    "config_list_add",
+                    key,
+                    {"was_present": False},
+                    add_it,
+                    lambda a, listed=listed, settled=settled: settled(a, listed()),
                 )
 
     def phase_retire(self) -> None:
@@ -749,7 +864,7 @@ class _Run:
 
     def phase_paths(self) -> None:
         for op in ("cron_write", "md_write"):
-            for entry in intents(self.journal.data, op):
+            for entry in newest_writes(self.journal.data, op):
                 if (
                     entry["state"] == PENDING
                     and file_sha256(Path(entry["args"]["path"])) == entry["args"]["sha_after"]
