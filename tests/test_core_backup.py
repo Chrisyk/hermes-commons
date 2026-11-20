@@ -10,7 +10,15 @@ from pathlib import Path
 
 import pytest
 
-from commons.core.backup import create_backup, list_backups, load_manifest, tree_sha256, verify_backup
+from commons.core import backup
+from commons.core.backup import (
+    BackupError,
+    create_backup,
+    list_backups,
+    load_manifest,
+    tree_sha256,
+    verify_backup,
+)
 from commons.core.fleet import Profile, discover
 
 NOW = datetime(2026, 11, 20, 9, 30, 5, tzinfo=UTC)
@@ -152,3 +160,166 @@ def test_backup_inside_a_skills_dir_does_not_recurse(tmp_path):
     assert (copy / "one" / "SKILL.md").is_file()
     assert not (copy / ".commons").exists()
     assert verify_backup(shared, bid) == []
+
+
+def _one_profile(tmp_path: Path) -> Profile:
+    home = tmp_path / "home"
+    (home / "skills" / "one").mkdir(parents=True)
+    (home / "skills" / "one" / "SKILL.md").write_text("---\nname: one\n---\n", encoding="utf-8")
+    (home / "skills" / "one" / "notes.txt").write_text("notes\n", encoding="utf-8")
+    (home / "skills" / "two").mkdir()
+    (home / "skills" / "two" / "SKILL.md").write_text("---\nname: two\n---\n", encoding="utf-8")
+    (home / "config.yaml").write_text("a: 1\n", encoding="utf-8")
+    return Profile("default", home)
+
+
+def test_plain_profile_records_no_symlinks(tmp_path):
+    shared = tmp_path / "shared"
+    bid = create_backup(shared, [_one_profile(tmp_path)], "plain", now=NOW)
+    entry = load_manifest(shared, bid)["profiles"]["default"]
+    assert entry["config_is_symlink"] is False and entry["config_link_target"] is None
+    assert entry["skills_is_symlink"] is False and entry["skills_link_target"] is None
+
+
+def test_symlinked_config_is_recorded_and_copied(tmp_path):
+    profile = _one_profile(tmp_path)
+    real = tmp_path / "dotfiles" / "config.yaml"
+    real.parent.mkdir()
+    real.write_text("from: dotfiles\n", encoding="utf-8")
+    (profile.home / "config.yaml").unlink()
+    (profile.home / "config.yaml").symlink_to(real)
+    shared = tmp_path / "shared"
+    bid = create_backup(shared, [profile], "linked", now=NOW)
+    entry = load_manifest(shared, bid)["profiles"]["default"]
+    assert entry["config_is_symlink"] is True
+    assert entry["config_link_target"] == str(real)
+    copy = _backups(shared) / bid / "default" / "config.yaml"
+    assert not copy.is_symlink()
+    assert copy.read_text(encoding="utf-8") == "from: dotfiles\n"
+    assert entry["skills_is_symlink"] is False
+    assert verify_backup(shared, bid) == []
+
+
+def test_symlinked_skills_dir_is_recorded_and_copied(tmp_path):
+    profile = _one_profile(tmp_path)
+    real = tmp_path / "library" / "skills"
+    real.parent.mkdir()
+    (profile.home / "skills").rename(real)
+    (profile.home / "skills").symlink_to("../library/skills", target_is_directory=True)
+    shared = tmp_path / "shared"
+    bid = create_backup(shared, [profile], "linked", now=NOW)
+    entry = load_manifest(shared, bid)["profiles"]["default"]
+    assert entry["skills_is_symlink"] is True
+    assert entry["skills_link_target"] == "../library/skills"
+    copy = _backups(shared) / bid / "default" / "skills"
+    assert copy.is_dir() and not copy.is_symlink()
+    assert (copy / "one" / "SKILL.md").is_file()
+    assert entry["skills_tree_sha256"] == tree_sha256(real)
+    assert entry["config_is_symlink"] is False
+    assert verify_backup(shared, bid) == []
+
+
+def test_skills_changed_mid_copy_fails_without_manifest(tmp_path, monkeypatch):
+    profile = _one_profile(tmp_path)
+    victim = profile.skills_dir / "two" / "SKILL.md"
+    real_copy = backup._copy_file
+    calls = []
+
+    def copy_and_edit(src, dst, *args, **kwargs):
+        calls.append(src)
+        if len(calls) == 1:
+            # A Hermes edit lands while the backup is halfway through.
+            victim.write_text("---\nname: two\n---\nedited mid-copy\n", encoding="utf-8")
+        return real_copy(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(backup, "_copy_file", copy_and_edit)
+    shared = tmp_path / "shared"
+    with pytest.raises(BackupError, match="changed while copying"):
+        create_backup(shared, [profile], "racy", now=NOW)
+    assert calls
+    assert list_backups(shared) == []
+    assert list((_backups(shared)).rglob("manifest.json")) == []
+    assert list((_backups(shared)).rglob(".manifest.json.tmp")) == []
+
+
+def test_skill_deleted_mid_copy_is_a_backup_error(tmp_path, monkeypatch):
+    profile = _one_profile(tmp_path)
+    real_copy = backup._copy_file
+
+    def copy_then_delete(src, dst, *args, **kwargs):
+        (profile.skills_dir / "two" / "SKILL.md").unlink(missing_ok=True)
+        return real_copy(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(backup, "_copy_file", copy_then_delete)
+    shared = tmp_path / "shared"
+    with pytest.raises(BackupError, match="changed while copying"):
+        create_backup(shared, [profile], "racy", now=NOW)
+    assert list_backups(shared) == []
+
+
+def test_data_is_fsynced_before_manifest_exists(tmp_path, monkeypatch):
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("needs /proc to map fds to paths")
+    profile = _one_profile(tmp_path)
+    (profile.skills_dir / "one" / "link").symlink_to("notes.txt")
+    synced: list[str] = []
+    events: list[tuple[str, str]] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def spy_fsync(fd):
+        path = os.readlink(f"/proc/self/fd/{fd}")
+        synced.append(path)
+        events.append(("fsync", path))
+        return real_fsync(fd)
+
+    def spy_replace(a, b, *args, **kwargs):
+        events.append(("replace", str(b)))
+        return real_replace(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(backup.os, "fsync", spy_fsync)
+    monkeypatch.setattr(backup.os, "replace", spy_replace)
+    shared = tmp_path / "shared"
+    bid = create_backup(shared, [profile], "durable", now=NOW)
+    base = _backups(shared) / bid
+    manifest = base / "manifest.json"
+    replace_at = events.index(("replace", str(manifest)))
+    before = {path for kind, path in events[:replace_at] if kind == "fsync"}
+    data = [base / "default" / "config.yaml"] + [
+        q for q in (base / "default").rglob("*") if not q.is_symlink()
+    ]
+    dirs = [base, base / "default", _backups(shared), shared / ".commons", shared]
+    for q in data + dirs:
+        assert str(q) in before, f"{q} not fsynced before the manifest"
+    assert str(base / ".manifest.json.tmp") in before
+    assert ("fsync", str(base)) in events[replace_at + 1 :]
+
+
+def test_hashing_reads_in_chunks(tmp_path, monkeypatch):
+    tree = tmp_path / "t"
+    tree.mkdir()
+    big = os.urandom(3 * 1024 * 1024 + 17)
+    (tree / "big.bin").write_bytes(big)
+    expected = hashlib.sha256()
+    expected.update(b"big.bin\x00f\x00-\x00" + str(len(big)).encode() + b"\x00" + big)
+    sizes: list[int] = []
+
+    class Spy:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def read(self, n=-1):
+            sizes.append(n)
+            return self.fh.read(n)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+
+    real_open = open
+    monkeypatch.setattr(backup, "open", lambda path, mode="r": Spy(real_open(path, mode)), raising=False)
+    monkeypatch.setattr(Path, "read_bytes", lambda self: pytest.fail("whole-file read"))
+    assert tree_sha256(tree) == expected.hexdigest()
+    assert sizes and all(0 < n <= 1024 * 1024 for n in sizes)
+    assert backup._file_sha256(tree / "big.bin") == hashlib.sha256(big).hexdigest()

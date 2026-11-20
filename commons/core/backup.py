@@ -3,7 +3,12 @@
 A backup holds each profile's config.yaml (if present) and its whole skills/
 dir, copied with symlinks kept as symlinks (never followed out of the tree),
 plus manifest.json with hashes so a backup can be verified before restore.
-Stdlib only.
+A symlinked config.yaml or skills/ dir is copied by content and the link is
+recorded in the manifest so restore can put the link back.
+
+Durability: every copied file and every created directory is fsynced before
+manifest.json is written (tmp + fsync + rename + fsync of the backup dir), so a
+manifest only exists once the data under it is on disk. Stdlib only.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ BACKUPS_DIR = "backups"
 MANIFEST = "manifest.json"
 SKILLS = "skills"
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_CHUNK = 1024 * 1024
 
 
 class BackupError(RuntimeError):
@@ -71,8 +77,10 @@ def tree_sha256(root: Path, exclude: tuple[Path, ...] = ()) -> str | None:
             h.update(b"d\x00")
         elif stat.S_ISREG(st.st_mode):
             exec_bit = b"x" if st.st_mode & stat.S_IXUSR else b"-"
-            data = p.read_bytes()
-            h.update(b"f\x00" + exec_bit + b"\x00" + str(len(data)).encode() + b"\x00" + data)
+            h.update(b"f\x00" + exec_bit + b"\x00" + str(st.st_size).encode() + b"\x00")
+            if _hash_into(h, p) != st.st_size:
+                # Size changed between lstat and read: never equal to a stable copy.
+                h.update(b"\x00size-changed")
         else:
             h.update(b"o\x00")
     return h.hexdigest()
@@ -86,15 +94,78 @@ def count_files(root: Path, exclude: tuple[Path, ...] = ()) -> int:
     return sum(1 for _, p in _walk(root, exclude) if p.is_symlink() or not p.is_dir())
 
 
+def _hash_into(h, path: Path) -> int:
+    """Feed path's bytes to h in 1 MiB chunks; return the byte count."""
+    total = 0
+    with open(path, "rb") as fh:
+        while chunk := fh.read(_CHUNK):
+            h.update(chunk)
+            total += len(chunk)
+    return total
+
+
 def _file_sha256(path: Path) -> str | None:
+    h = hashlib.sha256()
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        _hash_into(h, path)
     except FileNotFoundError:
         return None
+    return h.hexdigest()
+
+
+def _fsync_path(path: Path) -> None:
+    """fsync a file or directory by path (directories make their entries durable)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _mkdirs_durable(path: Path) -> None:
+    """mkdir -p, then fsync every created dir and the existing parent it was created in."""
+    created: list[Path] = []
+    p = path
+    while not p.exists():
+        created.append(p)
+        p = p.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for d in [*created, p]:
+        _fsync_path(d)
+
+
+def _copy_file(src: Path, dst: Path) -> None:
+    """Copy one regular file (data, mode, times) and fsync the copy."""
+    shutil.copy2(src, dst, follow_symlinks=False)
+    _fsync_path(dst)
+
+
+def _copy_tree(src: Path, dst: Path, exclude: tuple[Path, ...]) -> None:
+    """Copy src to a new dir dst, symlinks kept as links; fsync every file, then every dir."""
+    dst.mkdir()
+    dirs = [dst]
+    for rel, p in _walk(src, exclude):
+        target = dst / rel
+        st = p.lstat()
+        if stat.S_ISLNK(st.st_mode):
+            target.symlink_to(os.readlink(p))
+        elif stat.S_ISDIR(st.st_mode):
+            target.mkdir()
+            dirs.append(target)
+        elif stat.S_ISREG(st.st_mode):
+            _copy_file(p, target)
+        else:
+            # A fifo or socket would block or fail a copy; refuse instead.
+            raise BackupError(f"cannot back up {p}: not a file, folder or symlink")
+    # Deepest first, so each dir's entries are durable before its parent's.
+    # Like copytree, dir mode and times are copied once their contents are in.
+    for d in sorted(dirs, key=lambda q: len(q.parts), reverse=True):
+        shutil.copystat(src / d.relative_to(dst), d)
+        _fsync_path(d)
 
 
 def _new_backup_dir(root: Path, stamp: str, label: str) -> tuple[str, Path]:
-    root.mkdir(parents=True, exist_ok=True)
+    _mkdirs_durable(root)
     n = 1
     while True:
         bid = f"{stamp}-{label}" if n == 1 else f"{stamp}-{label}-{n}"
@@ -104,13 +175,23 @@ def _new_backup_dir(root: Path, stamp: str, label: str) -> tuple[str, Path]:
         except FileExistsError:
             n += 1
             continue
+        _fsync_path(root)
         return bid, target
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:
+    """tmp + fsync + os.replace + fsync of the parent dir."""
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+    _fsync_path(path.parent)
+
+
+def _link_target(path: Path) -> str | None:
+    return os.readlink(path) if path.is_symlink() else None
 
 
 def create_backup(shared_root: Path, profiles: list[Profile], label: str, now: datetime | None = None) -> str:
@@ -139,27 +220,38 @@ def create_backup(shared_root: Path, profiles: list[Profile], label: str, now: d
         config = profile.home / CONFIG_FILE
         if config.is_file():
             shutil.copy2(config, dest / CONFIG_FILE, follow_symlinks=True)
+            _fsync_path(dest / CONFIG_FILE)
         skills = profile.skills_dir
         source_hash = tree_sha256(skills, exclude)
         if skills.is_dir():
-
-            def ignore(directory: str, names: list[str]) -> set[str]:
-                return {n for n in names if _is_excluded((Path(directory) / n).resolve(), exclude)}
-
-            shutil.copytree(skills, dest / SKILLS, symlinks=True, ignore=ignore)
+            # A symlinked skills dir is followed at the top only (its contents are copied).
+            try:
+                _copy_tree(skills, dest / SKILLS, exclude)
+            except FileNotFoundError as exc:
+                raise BackupError(
+                    f"backup {bid}: {profile.name} skills changed while copying ({exc})"
+                ) from exc
+        _fsync_path(dest)
         copy_hash = tree_sha256(dest / SKILLS)
         if copy_hash != source_hash:
             raise BackupError(f"backup {bid}: {profile.name} skills changed while copying")
         config_hash = _file_sha256(config) if config.is_file() else None
         if config_hash != _file_sha256(dest / CONFIG_FILE):
             raise BackupError(f"backup {bid}: {profile.name} config.yaml changed while copying")
+        config_link = _link_target(config)
+        skills_link = _link_target(skills)
         entries[profile.name] = {
             "home": str(profile.home),
             "config_sha256": config_hash,
+            "config_is_symlink": config_link is not None,
+            "config_link_target": config_link,
             "skills_files": count_files(dest / SKILLS),
             "skills_tree_sha256": source_hash,
+            "skills_is_symlink": skills_link is not None,
+            "skills_link_target": skills_link,
         }
 
+    _fsync_path(target)
     manifest = {"id": bid, "created": now.isoformat(), "label": label, "profiles": entries}
     _write_json_atomic(target / MANIFEST, manifest)
     return bid
