@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import os
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
+from commons.core import configio
 from commons.core.configio import ConfigWriter, YamlFileWriter, hermes_config_set_argv, yaml_dump_flow
 from commons.core.fleet import Profile
+from tests.test_hash_fidelity import _hermes_python, _hermes_src
 
 
 def _profile(tmp_path: Path, config: dict | None = None, name: str = "device") -> Profile:
@@ -148,6 +154,7 @@ def test_argv_default_profile():
         "hermes",
         "config",
         "set",
+        "--",
         "skills.create_dir",
         "~/shared",
     ]
@@ -160,6 +167,7 @@ def test_argv_named_profile():
         "device",
         "config",
         "set",
+        "--",
         "plugins.enabled",
         "[a, commons]",
     ]
@@ -172,3 +180,78 @@ def test_unreadable_config_is_never_overwritten(tmp_path, text):
     with pytest.raises(ValueError):
         YamlFileWriter().set(p, "b", 2)
     assert (p.home / "config.yaml").read_text(encoding="utf-8") == text
+
+
+def test_argv_option_like_value_follows_double_dash():
+    argv = hermes_config_set_argv("default", "display.prefix", "-x")
+    assert argv == ["hermes", "config", "set", "--", "display.prefix", "-x"]
+    assert argv.index("--") < argv.index("-x")
+
+
+def test_new_config_is_private(tmp_path):
+    p = _profile(tmp_path)
+    YamlFileWriter().set(p, "a", 1)
+    assert stat.S_IMODE((p.home / "config.yaml").stat().st_mode) == 0o600
+
+
+def test_existing_config_keeps_its_mode(tmp_path):
+    p = _profile(tmp_path, {"a": 1})
+    (p.home / "config.yaml").chmod(0o640)
+    YamlFileWriter().set(p, "b", 2)
+    assert stat.S_IMODE((p.home / "config.yaml").stat().st_mode) == 0o640
+
+
+def test_parent_dir_fsynced_after_replace(tmp_path, monkeypatch):
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("needs /proc to map fds to paths")
+    p = _profile(tmp_path, {"a": 1})
+    events: list[tuple[str, str]] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def spy_fsync(fd):
+        events.append(("fsync", os.readlink(f"/proc/self/fd/{fd}")))
+        return real_fsync(fd)
+
+    def spy_replace(a, b, *args, **kwargs):
+        events.append(("replace", str(b)))
+        return real_replace(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(configio.os, "fsync", spy_fsync)
+    monkeypatch.setattr(configio.os, "replace", spy_replace)
+    YamlFileWriter().set(p, "b", 2)
+    target = str((p.home / "config.yaml").resolve())
+    at = events.index(("replace", target))
+    assert any(
+        kind == "fsync" and path.startswith(str(p.home.resolve()) + "/.config.yaml.")
+        for kind, path in events[:at]
+    )
+    assert ("fsync", str(p.home.resolve())) in events[at + 1 :]
+
+
+def test_double_dash_is_accepted_by_real_hermes(tmp_path):
+    """`hermes config set` is argparse with positionals key and value; '--' ends options."""
+    python, src = _hermes_python(), _hermes_src()
+    if python is None or src is None:
+        pytest.skip("no Hermes runtime python or Hermes source checkout found")
+    probe = (
+        "import argparse, json, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from hermes_cli.subcommands.config import build_config_parser\n"
+        "p = argparse.ArgumentParser(); sp = p.add_subparsers(dest='command')\n"
+        "build_config_parser(sp, cmd_config=lambda a: None)\n"
+        "a = p.parse_args(json.loads(sys.argv[2]))\n"
+        "print(json.dumps([a.config_command, a.key, a.value]))\n"
+    )
+    argv = hermes_config_set_argv("default", "display.prefix", "-x")[1:]
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "HERMES_HOME": str(tmp_path / "h")}
+    proc = subprocess.run(
+        [str(python), "-I", "-c", probe, str(src), json.dumps(argv)],
+        check=False,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) == ["set", "display.prefix", "-x"]

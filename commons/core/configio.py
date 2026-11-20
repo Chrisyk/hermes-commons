@@ -77,9 +77,17 @@ def yaml_dump_flow(value: Any) -> str:
 
 
 def hermes_config_set_argv(profile_name: str, key: str, value: Any) -> list[str]:
-    """argv for `hermes [-p <name>] config set <key> <yaml value>`; the default profile takes no -p."""
+    """argv for `hermes [-p <name>] config set -- <key> <yaml value>`; the default profile takes no -p.
+
+    `hermes config set` is a plain argparse subparser with two positionals
+    (key, value; hermes_cli/subcommands/config.py), so '--' ends option
+    parsing and a value such as '-x' is taken as the value, not an option.
+    Hermes' own pre-argparse -p scan (hermes_cli/_parser.py scan_profile_flag)
+    also stops at '--', so a value of '-p' cannot select a profile either.
+    tests/test_core_configio.py checks this against the real Hermes parser.
+    """
     _parts(key)
-    argv = ["hermes", "config", "set", key, yaml_dump_flow(value)]
+    argv = ["hermes", "config", "set", "--", key, yaml_dump_flow(value)]
     if profile_name != DEFAULT_PROFILE:
         argv[1:1] = ["-p", profile_name]
     return argv
@@ -114,7 +122,7 @@ class YamlFileWriter:
         try:
             mode = stat.S_IMODE(path.stat().st_mode)
         except FileNotFoundError:
-            mode = 0o644
+            mode = 0o600  # a new config may hold API keys: owner only
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -127,6 +135,12 @@ class YamlFileWriter:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp)
             raise
+        # Make the rename itself durable.
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
     def get(self, profile: Profile, key: str) -> Any:
         return _lookup(self._load(profile), _parts(key))
