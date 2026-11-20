@@ -26,3 +26,9 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 110
 target-version = "py311"
+
+[tool.ruff.lint.per-file-ignores]
+# The repo root is also the Hermes plugin dir, so it has an __init__.py and ruff
+# names the package after the folder (hermes-commons); Hermes imports it as
+# hermes_plugins.commons and pytest never imports it.
+"**/__init__.py" = ["N999"]

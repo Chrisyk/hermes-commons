@@ -291,8 +291,43 @@ def test_register_wires_hooks_cli_and_slash():
     ctx = FakeCtx()
     commons.register(ctx)
     assert {n for n, _ in ctx.hooks} == {"on_skill_lifecycle", "on_session_start"}
-    assert [(n, s, h) for n, s, h in ctx.cli] == [("commons", cli.setup_fn, cli.handler_fn)]
-    assert [(n, h, a) for n, h, a in ctx.commands] == [("commons", cli.slash_handler, "status|check")]
+    assert [n for n, _s, _h in ctx.cli] == ["commons"]
+    assert [(n, a) for n, _h, a in ctx.commands] == [("commons", "status|check")]
+
+
+def test_registered_wrappers_reach_the_cli(env):
+    ctx = FakeCtx()
+    commons.register(ctx)
+    _name, setup, handler = ctx.cli[0]
+    parser = argparse.ArgumentParser()
+    setup(parser)
+    assert handler(parser.parse_args(["status"])) == 0
+    assert "default" in ctx.commands[0][1]("status")
+    hooks_by_name = dict(ctx.hooks)
+    assert hooks_by_name["on_skill_lifecycle"](action="loaded", skill_name="x") is None
+
+
+def test_register_imports_only_the_standard_library():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    probe = (
+        "import sys\n"
+        "sys.modules['yaml'] = None\n"
+        "import commons\n"
+        "class C:\n"
+        "    def __getattr__(self, n):\n"
+        "        return lambda *a, **k: None\n"
+        "commons.register(C())\n"
+        "bad = sorted(m for m in sys.modules if m.startswith('commons.'))\n"
+        "assert not bad, bad\n"
+    )
+    repo = Path(commons.__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [sys.executable, "-c", probe], check=False, cwd=repo, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_check_without_a_bundled_index_still_runs(env, monkeypatch, capsys):
@@ -318,3 +353,29 @@ def test_writing_commands_without_yes_exit_2_and_change_nothing(env, capsys):
         assert run(*argv) == 2, argv
         assert "needs confirmation; rerun with --yes" in capsys.readouterr().err
     assert (snapshot(env["root"]), GitRepo(env["shared"]).log()) == before
+
+
+def test_missing_dependencies_give_one_clear_message(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    probe = (
+        "import argparse, sys\n"
+        "sys.modules['yaml'] = None\n"
+        "import commons\n"
+        "p = argparse.ArgumentParser()\n"
+        "commons.setup_fn(p)\n"
+        "rc = commons.handler_fn(p.parse_args(['status', '--only', 'x']))\n"
+        "print('RC', rc)\n"
+        "print('SLASH', commons.slash_handler('status'))\n"
+        "commons.on_skill_lifecycle(action='edited', skill_name='x')\n"
+    )
+    repo = Path(commons.__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [sys.executable, "-c", probe], check=False, cwd=repo, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "RC 1" in proc.stdout
+    assert "SLASH commons cannot load its dependencies" in proc.stdout
+    assert "hermes pm repair" in proc.stderr
