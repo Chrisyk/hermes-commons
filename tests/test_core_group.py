@@ -421,3 +421,83 @@ def test_frontmatter_exemption_only_in_leading_block(fleet):
     b = {"SKILL.md": _MD_PLUS}
     _, g = _pair(fleet, a, b)
     assert g.status == "conflict"
+
+
+# Hermes skips EXCLUDED_SKILL_DIRS when hashing, but setup retires a contained
+# copy with everything in it, so grouping counts those dirs byte for byte.
+# Only regenerable runtime caches are ignored.
+
+_EXCLUDED_ONLY_IN_A = {
+    ".git": {".git/HEAD": "ref: refs/heads/main\n"},
+    ".github": {".github/workflows/ci.yml": "on: push\n"},
+    "node_modules": {"node_modules/x/index.js": "module.exports=1\n"},
+}
+
+
+@pytest.mark.parametrize("case", list(_EXCLUDED_ONLY_IN_A))
+def test_excluded_dir_only_in_smaller_copy_is_conflict(fleet, case):
+    _, g = _pair(fleet, {"SKILL.md": _MD, **_EXCLUDED_ONLY_IN_A[case]}, {"SKILL.md": _MD_PLUS})
+    assert g.status == "conflict", case
+    assert g.keep is None
+    assert g.unique_files["default:t/x"] == sorted(_EXCLUDED_ONLY_IN_A[case])
+
+
+def test_same_git_dir_in_both_is_contained(fleet):
+    git = {".git/HEAD": "ref: refs/heads/main\n", ".git/objects/ab/cd": b"\x00blob"}
+    _, g = _pair(fleet, {"SKILL.md": _MD, **git}, {"SKILL.md": _MD_PLUS, **git})
+    assert g.status == "contained"
+    assert g.keep is not None and g.keep.id == "device:t/x"
+
+
+def test_excluded_dir_text_is_compared_byte_for_byte(fleet):
+    a = {"SKILL.md": _MD, ".git/config": "[core]\n"}
+    b = {"SKILL.md": _MD_PLUS, ".git/config": "[core]\nbare = false\n"}
+    _, g = _pair(fleet, a, b)
+    assert g.status == "conflict"
+
+
+def test_runtime_cache_only_in_smaller_copy_is_contained(fleet):
+    a = {
+        "SKILL.md": _MD,
+        "scripts/run.py": "print(1)\n",
+        "scripts/run.pyc": b"\x00bytecode",
+        "__pycache__/run.cpython-314.pyc": b"\x00bytecode",
+        ".pytest_cache/v/cache/nodeids": "[]\n",
+        "scripts/.ruff_cache/x": "cache\n",
+    }
+    b = {"SKILL.md": _MD_PLUS, "scripts/run.py": "print(1)\n"}
+    _, g = _pair(fleet, a, b)
+    assert g.status == "contained"
+    assert g.keep is not None and g.keep.id == "device:t/x"
+
+
+def test_sourceless_pyc_counts_as_content(fleet):
+    a = {"SKILL.md": _MD, "scripts/tool.pyc": b"\x00shipped"}
+    _, g = _pair(fleet, a, {"SKILL.md": _MD_PLUS})
+    assert g.status == "conflict"
+    assert g.unique_files["default:t/x"] == ["scripts/tool.pyc"]
+
+
+def test_copies_differing_only_in_git_are_not_identical(fleet):
+    a = {"SKILL.md": _MD, ".git/HEAD": "ref: refs/heads/main\n"}
+    b = {"SKILL.md": _MD, ".git/HEAD": "ref: refs/heads/dev\n"}
+    _, g = _pair(fleet, a, b)
+    copies = {c.id: c for c in g.copies}
+    assert copies["default:t/x"].tree_hash == copies["device:t/x"].tree_hash
+    assert g.status == "conflict"
+    assert g.keep is None
+
+
+def test_copies_differing_only_in_runtime_cache_are_identical(fleet):
+    a = {"SKILL.md": _MD, "__pycache__/m.cpython-314.pyc": b"\x00one"}
+    b = {"SKILL.md": _MD, "__pycache__/m.cpython-314.pyc": b"\x00two"}
+    _, g = _pair(fleet, a, b)
+    assert g.status == "identical"
+    assert g.keep is not None and g.keep.id == "default:t/x"
+
+
+def test_excluded_dir_difference_in_one_profile_is_dup(fleet):
+    a = {"SKILL.md": _MD, ".git/HEAD": "ref: refs/heads/main\n"}
+    b = {"SKILL.md": _MD}
+    root = fleet({"default": {"a/x": a, "b/x": b}})
+    assert _groups(root)["x"].status == "in-profile-dup"

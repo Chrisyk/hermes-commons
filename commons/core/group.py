@@ -7,6 +7,16 @@ copies (pristine bundled or hub installs, symlinks) stay listed in the group.
 
 Containment is judged file by file (see _contained) and errs towards
 'conflict', because setup later retires every contained copy.
+
+Grouping reads its own content view of each copy (see _content), not the
+scan.tree_hash walk: tree_hash mirrors Hermes and skips EXCLUDED_SKILL_DIRS
+and all *.pyc/*.pyo, but a retired copy loses those files too, so here only
+regenerable runtime caches are ignored and everything else (.git, .github,
+node_modules, .venv, ...) counts, compared byte for byte. The only accepted
+losses are the three text normalizations of _text_lines: trailing spaces,
+tabs and CRs stripped, CRLF read as LF, and SKILL.md frontmatter version:,
+updated: and last_updated: lines ignored; merge --accept and the setup
+backups cover them.
 """
 
 from __future__ import annotations
@@ -22,7 +32,7 @@ from pathlib import Path
 from typing import Literal
 
 from commons.core.fleet import DEFAULT_PROFILE
-from commons.core.scan import SKILL_FILE, SkillCopy, _hash_entries
+from commons.core.scan import EXCLUDED_SKILL_DIRS, SKILL_FILE, SkillCopy
 
 Status = Literal[
     "identical", "contained", "conflict", "stays-local", "in-profile-dup", "unreadable", "nested"
@@ -30,6 +40,14 @@ Status = Literal[
 
 MOVABLE_KINDS = frozenset({"own", "bundled-edited", "hub-edited"})
 TAKEN_OVER_KINDS = frozenset({"bundled-edited", "hub-edited"})
+
+# Mirror of Hermes tools/skills_sync_optional.py _RUNTIME_CACHE_DIRS: the only
+# excluded dirs whose loss is harmless, since they are regenerated on use.
+_RUNTIME_CACHE_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+# Every other Hermes-excluded dir is kept and compared as raw bytes.
+_OPAQUE_DIRS = EXCLUDED_SKILL_DIRS - _RUNTIME_CACHE_DIRS
+_BYTECODE_SUFFIXES = (".pyc", ".pyo")
+_CHUNK = 1 << 20
 
 _SNIFF = 8 * 1024
 _TRAILING_WS = " \t\r"
@@ -97,44 +115,102 @@ class _File:
     kind: Literal["text", "binary", "link"]
     executable: bool
     lines: tuple[str, ...] = ()  # text files only
-    digest: str = ""  # sha256 of the bytes (binary) or of the link target (link)
+    digest: str = ""  # sha256 of the bytes (files) or of the link target (link)
 
 
 def _is_executable(full: str) -> bool:
     return bool(os.stat(full).st_mode & 0o111)
 
 
+def _read_opaque(full: str) -> _File:
+    h = hashlib.sha256()
+    with open(full, "rb") as fh:
+        while chunk := fh.read(_CHUNK):
+            h.update(chunk)
+    return _File("binary", _is_executable(full), digest=h.hexdigest())
+
+
 def _read_file(rel: str, full: str) -> _File:
     with open(full, "rb") as fh:
         data = fh.read()
     executable = _is_executable(full)
+    digest = hashlib.sha256(data).hexdigest()
     if is_text(data):
-        return _File("text", executable, lines=_text_lines(data, rel == SKILL_FILE))
-    return _File("binary", executable, digest=hashlib.sha256(data).hexdigest())
+        return _File("text", executable, lines=_text_lines(data, rel == SKILL_FILE), digest=digest)
+    return _File("binary", executable, digest=digest)
+
+
+def _is_runtime_bytecode(full: str) -> bool:
+    """A *.pyc/*.pyo next to its .py source, as Hermes _is_runtime_cache; source-less bytecode is content."""
+    root, ext = os.path.splitext(full)
+    return ext in _BYTECODE_SUFFIXES and os.path.isfile(root + ".py")
+
+
+def _content_entries(top: str) -> list[tuple[str, str, str]]:
+    """(rel, kind, path) of every file ('F') and inner symlink ('L') but runtime caches.
+
+    Unlike scan._hash_entries, which mirrors Hermes hashing, this keeps every
+    EXCLUDED_SKILL_DIRS entry except _RUNTIME_CACHE_DIRS and keeps source-less
+    bytecode. A symlink named like a cache dir is kept (as a link): only real
+    cache dirs are regenerable. Raises OSError on any walk error.
+    """
+    entries: list[tuple[str, str, str]] = []
+    errors: list[OSError] = []
+    for dirpath, dirnames, filenames in os.walk(top, onerror=errors.append, followlinks=False):
+        keep = []
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            if os.path.islink(full):
+                entries.append((os.path.relpath(full, top).replace(os.sep, "/"), "L", full))
+            elif d not in _RUNTIME_CACHE_DIRS:
+                keep.append(d)
+        dirnames[:] = keep
+        for fname in filenames:
+            full = os.path.join(dirpath, fname)
+            if os.path.islink(full):
+                entries.append((os.path.relpath(full, top).replace(os.sep, "/"), "L", full))
+            elif not _is_runtime_bytecode(full):
+                entries.append((os.path.relpath(full, top).replace(os.sep, "/"), "F", full))
+    if errors:
+        raise errors[0]
+    return entries
 
 
 def _content(directory: Path) -> dict[str, _File]:
-    """Every file and inner symlink of a skill tree by POSIX rel path, walked like scan.tree_hash.
+    """The grouping view of a skill tree: every entry of _content_entries by POSIX rel path.
 
-    Raises OSError when any part of the tree cannot be read.
+    A file under an _OPAQUE_DIRS dir (.git, node_modules, ...) is read
+    as binary whatever its bytes, so it only counts as contained when the
+    bytes match exactly. Non-regular files (FIFOs, sockets) are skipped as in
+    scan.tree_hash. Raises OSError when any part of the tree cannot be read.
     """
-    entries, error = _hash_entries(Path(directory))
-    if error:
-        raise OSError(error)
     out: dict[str, _File] = {}
-    for rel, kind, full in sorted(entries):
+    for rel, kind, full in sorted(_content_entries(os.fspath(directory))):
         if kind == "L":
             target = os.readlink(full).encode("utf-8", "surrogateescape")
             out[rel] = _File("link", False, digest=hashlib.sha256(target).hexdigest())
         elif stat.S_ISREG(os.lstat(full).st_mode):
-            out[rel] = _read_file(rel, full)
+            opaque = any(part in _OPAQUE_DIRS for part in rel.split("/")[:-1])
+            out[rel] = _read_opaque(full) if opaque else _read_file(rel, full)
     return out
+
+
+def _identity(content: dict[str, _File]) -> frozenset[tuple[str, str, bool, str]]:
+    """Exact identity of a content view: rel path, kind, executable bit and raw-byte digest per entry.
+
+    Stricter than scan.tree_hash, which skips EXCLUDED_SKILL_DIRS and ignores
+    file modes, so two copies differing only in .git or an executable bit are
+    not 'identical' here.
+    """
+    return frozenset((rel, f.kind, f.executable, f.digest) for rel, f in content.items())
 
 
 def file_lines(path: Path) -> Counter[str]:
     """The compared lines of one text file as a multiset (see _text_lines).
 
-    A file named SKILL.md gets the frontmatter exemption. Raises ValueError
+    Kept for the merge phase: merge validation checks a merged skill file by
+    file against every source copy and needs these per-file lines. A file
+    named SKILL.md gets the frontmatter exemption. Raises ValueError
     for a binary file and OSError when it cannot be read.
     """
     path = Path(path)
@@ -194,11 +270,6 @@ def _unique(c: str, survivors: list[str], contents: dict[str, dict[str, _File]])
     return lines, sorted(only)
 
 
-def _exec_bits(copy: SkillCopy) -> frozenset[str]:
-    entries, _ = _hash_entries(copy.path)
-    return frozenset(rel for rel, kind, full in entries if kind == "F" and _is_executable(full))
-
-
 def _decide(name: str, copies: list[SkillCopy]) -> Group:
     copies = sorted(copies, key=_copy_order)
     taken_over = any(c.kind in TAKEN_OVER_KINDS for c in copies)
@@ -212,21 +283,23 @@ def _decide(name: str, copies: list[SkillCopy]) -> Group:
     if any(c.parent_rel is not None for c in movable):
         result.status = "nested"
         return result
-    by_profile: dict[str, set[str]] = {}
-    for c in movable:
-        by_profile.setdefault(c.profile, set()).add(c.tree_hash)
-    if any(len(hashes) > 1 for hashes in by_profile.values()):
-        result.status = "in-profile-dup"
-        return result
     try:
-        # tree_hash ignores file modes, so equal hashes still need equal executable bits.
-        if len({c.tree_hash for c in movable}) == 1 and len({_exec_bits(c) for c in movable}) == 1:
-            result.status = "identical"
-            result.keep = movable[0]
-            return result
         contents = {c.id: _content(c.path) for c in movable}
     except OSError:
         result.status = "unreadable"
+        return result
+    identity = {c.id: _identity(contents[c.id]) for c in movable}
+    by_profile: dict[str, set[frozenset]] = {}
+    for c in movable:
+        by_profile.setdefault(c.profile, set()).add(identity[c.id])
+    if any(len(ids) > 1 for ids in by_profile.values()):
+        result.status = "in-profile-dup"
+        return result
+    # Equal content views, not just equal tree_hash: tree_hash skips .git and
+    # friends and ignores file modes (see _identity).
+    if len({c.tree_hash for c in movable}) == 1 and len(set(identity.values())) == 1:
+        result.status = "identical"
+        result.keep = movable[0]
         return result
     rank = {c.id: i for i, c in enumerate(movable)}
     # Smallest copy first; on equal size the later copy goes first, so of two
@@ -254,8 +327,10 @@ def group(copies: Iterable[SkillCopy]) -> list[Group]:
     Rules, first match wins, over the movable copies (kind own, bundled-edited
     or hub-edited and not via_symlink): none -> stays-local; any with an error
     -> unreadable; any nested in another skill -> nested; two with different
-    trees in one profile -> in-profile-dup; one tree hash -> identical (keep
-    the first copy in profile order, executable bits equal too); one copy left
+    content views (see _content) in one profile -> in-profile-dup; one tree
+    hash and one exact content view (bytes, executable bits, excluded dirs
+    such as .git included) -> identical (keep the first copy in profile
+    order); one copy left
     after dropping every copy contained in another (see _contained) ->
     contained (keep it); otherwise conflict, with per surviving copy the count
     of lines no other survivor has in the same file (multiset) and the files

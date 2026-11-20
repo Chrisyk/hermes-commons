@@ -15,7 +15,6 @@ from commons.core.report import (
     index_lines,
     index_row_chars,
     platform_matches,
-    read_description,
     render_status,
     status,
 )
@@ -128,17 +127,6 @@ def test_no_shared_root(classic_fleet):
     report = _status(classic_fleet)
     assert report.shared_root is None
     assert "shared root: none" in render_status(report)
-
-
-def test_read_description(tmp_path):
-    md = tmp_path / "SKILL.md"
-    md.write_text('---\nname: x\ndescription: "Quoted text."\n---\nbody\n', encoding="utf-8")
-    assert read_description(md) == "Quoted text."
-    md.write_text("---\nname: x\ndescription: >\n  Folded over\n  two lines.\n---\n", encoding="utf-8")
-    assert read_description(md) == "Folded over two lines."
-    md.write_text("---\nname: x\n---\ndescription: in body\n", encoding="utf-8")
-    assert read_description(md) == ""
-    assert read_description(tmp_path / "missing.md") == ""
 
 
 def test_clip_description_mirrors_hermes():

@@ -165,7 +165,7 @@ def read_skill_name(skill_md: Path, fallback: str) -> str:
 
 
 def read_frontmatter_value(skill_md: Path, key: str) -> str:
-    """Line-based frontmatter read shared by read_skill_name and the report's description.
+    """Line-based frontmatter read behind read_skill_name.
 
     Same rules as Hermes read_skill_name for ``name``, generalized to any key:
     the first non-empty ``<key>:`` value in the first ``---`` block of the

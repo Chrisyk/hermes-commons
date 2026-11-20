@@ -40,7 +40,6 @@ from pathlib import Path
 from typing import Any
 
 from commons.core.fleet import Profile
-from commons.core.frontmatter import parse_frontmatter
 from commons.core.resolve import (
     TIER_CREATE_DIR,
     TIER_LOCAL,
@@ -56,7 +55,6 @@ from commons.core.resolve import (
     provably_same,
     resolve_index,
 )
-from commons.core.scan import read_frontmatter_value
 
 # Mirror of Hermes agent/skill_utils.py SKILL_PROMPT_DESC_LIMIT, _LAST_WHITESPACE_RE, _CLIP_TRAIL_RE.
 SKILL_PROMPT_DESC_LIMIT = 60
@@ -92,23 +90,6 @@ def description_of(frontmatter: Mapping[str, Any]) -> str:
     """Mirror of Hermes extract_skill_description (_normalize_skill_description then clip)."""
     raw = frontmatter.get("description", "")
     return clip_description(str(raw).strip().strip("'\"") if raw else "")
-
-
-def read_description(skill_md: Path) -> str:
-    """Unclipped frontmatter description, parsed as YAML (folded and literal values work).
-
-    Falls back to the line parser only when the file has no YAML mapping
-    block; '' if missing.
-    """
-    try:
-        text = Path(skill_md).read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
-        return ""
-    fm = parse_frontmatter(text)
-    if not fm:
-        return read_frontmatter_value(Path(skill_md), "description")
-    raw = fm.get("description", "")
-    return str(raw).strip().strip("'\"") if raw else ""
 
 
 def index_row_chars(name: str, description: str, indent: str = "    ") -> int:
