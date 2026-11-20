@@ -77,3 +77,10 @@ def test_malformed_config_yields_empty_dict(classic_fleet):
     assert by_name["device"].config == {}
     assert by_name["pikvm"].config == {}
     assert by_name["device"].create_dir() is None
+
+
+def test_named_profile_called_default_is_skipped(classic_fleet):
+    _write_config(classic_fleet / "profiles" / "default", {})
+    profiles = discover(classic_fleet)
+    assert [p.name for p in profiles].count("default") == 1
+    assert profiles[0].home == classic_fleet

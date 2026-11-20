@@ -4,9 +4,14 @@ Reference implementations below are copied from Hermes on purpose, so these
 tests stay independent of tests/fleet.py.
 """
 
+import glob
 import hashlib
+import importlib.util
 import json
+import os
 import re
+import subprocess
+import sys
 from contextlib import suppress
 from pathlib import Path
 
@@ -123,10 +128,92 @@ def test_bad_string_entry_raises(tmp_path):
         make_fleet(tmp_path, {"default": {"general/bad": "not-a-symlink-spec"}})
 
 
-def test_matches_real_hermes(tmp_path, monkeypatch):
-    monkeypatch.syspath_prepend(str(Path.home() / ".hermes" / "hermes-agent"))
-    skills_sync = pytest.importorskip("tools.skills_sync")
-    skills_guard = pytest.importorskip("tools.skills_guard")
+_HERMES_PROBE = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import hermes_bootstrap  # noqa: F401
+from pathlib import Path
+from tools.skills_sync import dir_hash
+from tools.skills_guard import content_hash
+from tools.skill_usage import read_skill_name
+tree = Path(sys.argv[2])
+names = {p: read_skill_name(Path(p), "fallback") for p in sys.argv[3:]}
+print(json.dumps({"dir_hash": dir_hash(tree), "content_hash": content_hash(tree), "names": names}))
+"""
+
+_NAME_CASES = {
+    "plain": "---\nname: plain\ndescription: d\n---\nbody\n",
+    "unclosed": "---\nname: [unclosed\n---\n",
+    "number": "---\nname: 123\n---\n",
+    "blank-first": "\n---\nname: after-blank\n---\n",
+    "double": '---\nname: "double"\n---\n',
+    "single": "---\nname: 'single'\n---\n",
+    "no-close": "---\nname: no-close\nbody\n",
+    "empty-then": "---\nname:\nname: second\n---\n",
+    "body-name": "---\ndescription: d\n---\nname: body\n",
+    "bom": "\ufeff---\nname: bom\n---\n",
+    "crlf": "---\r\nname: crlf\r\n---\r\n",
+    "no-frontmatter": "no frontmatter\nname: x\n",
+    "indented": "---\n  name: indented\n---\n",
+    "colon": "---\nname: a:b\n---\n",
+}
+
+
+def _load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module  # dataclasses resolve annotations through sys.modules
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[name]
+        raise
+    return module
+
+
+def _hermes_python() -> Path | None:
+    env = os.environ.get("COMMONS_HERMES_PYTHON")
+    if env:
+        return Path(env) if Path(env).is_file() else None
+    found = sorted(glob.glob(str(Path.home() / ".hermes" / "tools" / "python-*" / "bin" / "python3")))
+    return Path(found[0]) if found else None
+
+
+def _hermes_src() -> Path | None:
+    src = Path(os.environ.get("COMMONS_HERMES_SRC") or Path.home() / ".hermes" / "hermes-agent")
+    return src if (src / "hermes_bootstrap.py").is_file() else None
+
+
+def test_matches_real_hermes(tmp_path):
+    python, src = _hermes_python(), _hermes_src()
+    if python is None or src is None:
+        pytest.skip("no Hermes runtime python or Hermes source checkout found")
+    repo = Path(__file__).resolve().parent.parent
+    fleet = _load("_commons_fleet_by_path", repo / "tests" / "fleet.py")
+    scan = _load("_commons_scan_by_path", repo / "commons" / "core" / "scan.py")
     tree = _golden_tree(tmp_path / "tree")
-    assert dir_hash_md5(tree) == skills_sync.dir_hash(tree)
-    assert hub_content_hash(tree) == skills_guard.content_hash(tree)
+    names_dir = tmp_path / "names"
+    md_paths = []
+    for case, text in _NAME_CASES.items():
+        md = names_dir / case / "SKILL.md"
+        md.parent.mkdir(parents=True)
+        md.write_bytes(text.encode("utf-8"))
+        md_paths.append(str(md))
+    work = tmp_path / "cwd"
+    work.mkdir()
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(work), "HERMES_HOME": str(work / "hermes")}
+    proc = subprocess.run(
+        [str(python), "-I", "-c", _HERMES_PROBE, str(src), str(tree), *md_paths],
+        check=False,
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    real = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert fleet.dir_hash_md5(tree) == real["dir_hash"]
+    assert fleet.hub_content_hash(tree) == real["content_hash"]
+    ours = {p: scan.read_skill_name(Path(p), "fallback") for p in md_paths}
+    assert ours == real["names"]

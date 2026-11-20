@@ -82,6 +82,9 @@ def discover(root: Path, is_deleted: Callable[[Path], bool] = lambda p: False) -
     except OSError:
         entries = []
     for home in entries:
+        # A named profile called "default" would collide with the root profile.
+        if home.name == DEFAULT_PROFILE:
+            continue
         if not home.is_dir() or not (home / CONFIG_FILE).is_file() or is_deleted(home):
             continue
         found.append(_profile(home.name, home))
