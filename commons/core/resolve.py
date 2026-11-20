@@ -73,13 +73,13 @@ def _resolve_path(p: Path) -> Path:
         return p
 
 
-def _config_path(profile: Path, path: Path) -> Path:
+def config_path(profile: Path, path: Path) -> Path:
     """Mirror of Hermes _expand_path + _home_relative + resolve for a config entry."""
     expanded = Path(os.path.expandvars(os.fspath(path))).expanduser()
     return _resolve_path(expanded if expanded.is_absolute() else profile / expanded)
 
 
-def _is_dir(p: Path) -> bool:
+def is_dir(p: Path) -> bool:
     try:
         return p.is_dir()
     except OSError:
@@ -91,17 +91,17 @@ def search_roots(profile: Profile, project_dirs: Sequence[Path] = ()) -> list[Ro
     local = profile.skills_dir
     local_resolved = _resolve_path(local)
     roots: list[tuple[int, Path]] = [(TIER_PROJECT, _resolve_path(Path(d))) for d in project_dirs]
-    if _is_dir(local):
+    if is_dir(local):
         roots.append((TIER_LOCAL, local))
     create = profile.create_dir()
     if create is not None:
-        create = _config_path(profile.home, create)
-        if create != local_resolved and _is_dir(create):
+        create = config_path(profile.home, create)
+        if create != local_resolved and is_dir(create):
             roots.append((TIER_CREATE_DIR, create))
     externals: list[Path] = []
     for entry in profile.external_dirs():
-        p = _config_path(profile.home, entry)
-        if p != local_resolved and p not in externals and _is_dir(p):
+        p = config_path(profile.home, entry)
+        if p != local_resolved and p not in externals and is_dir(p):
             externals.append(p)
     roots += [(TIER_EXTERNAL, p) for p in externals]
 

@@ -161,17 +161,28 @@ def read_skill_name(skill_md: Path, fallback: str) -> str:
     between the first ``---`` line and the next one (or the end of the first
     4000 chars), quotes stripped; otherwise *fallback*.
     """
+    return read_frontmatter_value(skill_md, "name") or fallback
+
+
+def read_frontmatter_value(skill_md: Path, key: str) -> str:
+    """Line-based frontmatter read shared by read_skill_name and the report's description.
+
+    Same rules as Hermes read_skill_name for ``name``, generalized to any key:
+    the first non-empty ``<key>:`` value in the first ``---`` block of the
+    first 4000 chars, quotes stripped; '' when missing or unreadable.
+    """
     try:
         text = skill_md.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
-        return fallback
+        return ""
     lines = [line.strip() for line in text[:4000].split("\n")]
     if "---" not in lines:
-        return fallback
+        return ""
     block = lines[lines.index("---") + 1 :]
     block = block[: block.index("---")] if "---" in block else block
-    values = (line.split(":", 1)[1].strip().strip("\"'") for line in block if line.startswith("name:"))
-    return next((v for v in values if v), fallback)
+    prefix = f"{key}:"
+    values = (line.split(":", 1)[1].strip().strip("\"'") for line in block if line.startswith(prefix))
+    return next((v for v in values if v), "")
 
 
 def read_manifest(skills_dir: Path) -> dict[str, str]:
