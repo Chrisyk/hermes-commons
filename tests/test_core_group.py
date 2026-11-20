@@ -1,9 +1,13 @@
 """Tests for commons.core.group grouping and containment."""
 
+import os
+from collections import Counter
 from dataclasses import replace
 
+import pytest
+
 from commons.core.fleet import discover
-from commons.core.group import group, is_text, normalized_lines
+from commons.core.group import file_lines, group, is_text
 from commons.core.scan import scan_profile
 from tests.fleet import dir_hash_md5, hub_content_hash, skill_md, write_files
 
@@ -128,6 +132,7 @@ def test_binary_only_in_smaller_copy_is_conflict(fleet):
     g = _groups(root)["bin"]
     assert g.status == "conflict"
     assert g.unique_lines == {"default:t/bin": 0, "device:t/bin": 1}
+    assert g.unique_files == {"default:t/bin": ["assets/logo.png"], "device:t/bin": []}
 
 
 def test_binary_with_same_bytes_is_contained(fleet):
@@ -148,7 +153,7 @@ def test_binary_with_different_bytes_is_conflict(fleet):
 
 
 def test_equal_line_sets_keep_earlier_profile(fleet):
-    a = "---\nname: ws\n---\nsome   spaced    line\n# \n"
+    a = "---\r\nname: ws\r\n---\r\n  some spaced line   \r\n"
     b = "---\nname: ws\n---\n  some spaced line\n"
     root = fleet({"pocket": {"t/ws": {"SKILL.md": a}}, "device": {"t/ws": {"SKILL.md": b}}})
     g = _groups(root)["ws"]
@@ -239,18 +244,33 @@ def test_hub_edited_is_taken_over(classic_fleet):
     assert g.taken_over is True
 
 
-def test_normalized_lines_skips_trivial(tmp_path):
+def test_file_lines_keeps_everything_but_skill_md_version_lines(tmp_path):
     md = tmp_path / "SKILL.md"
-    md.write_text(
-        "---\nname: x\nversion: 3\nupdated: today\nlast_updated: now\n```python\n```\n##  \n- \n> \n| \n"
-        "abc\n  real    content   line  \n",
-        encoding="utf-8",
+    md.write_bytes(
+        b"---\r\nname: x\nversion: 3\nupdated: today\nlast_updated: now\n---\n"
+        b"```python\n```\n\n  indented   line  \nab\nab\nversion: body keeps\n"
     )
-    assert normalized_lines(md) == {"name: x", "real content line"}
-    write_files(
-        tmp_path / "tree", {"a.md": "line one here\n", "b/c.txt": "line two here\n", "d.bin": b"\x00zz"}
+    assert file_lines(md) == Counter(
+        [
+            "---",
+            "name: x",
+            "---",
+            "```python",
+            "```",
+            "",
+            "  indented   line",
+            "ab",
+            "ab",
+            "version: body keeps",
+        ]
     )
-    assert normalized_lines(tmp_path / "tree") == {"line one here", "line two here"}
+    other = tmp_path / "notes.md"
+    other.write_text("---\nversion: 3\n---\n", encoding="utf-8")
+    assert file_lines(other) == Counter(["---", "version: 3", "---"])
+    binary = tmp_path / "d.bin"
+    binary.write_bytes(b"\x00zz")
+    with pytest.raises(ValueError):
+        file_lines(binary)
 
 
 def test_is_text():
@@ -260,3 +280,144 @@ def test_is_text():
     assert not is_text(b"\xff\xfe broken")
     assert not is_text(b"x" * 9000 + b"\xff")
     assert is_text(b"")
+
+
+# Containment is per file: every file of the smaller copy must exist in the bigger
+# one at the same path, with its lines present there in the same order.
+
+_BASE = ["step one do this", "step two do that"]
+_MD = skill_md("x", "d", _BASE)
+_MD_PLUS = skill_md("x", "d", [*_BASE, "extra line"])
+
+
+def _pair(fleet, a, b):
+    """Group of skill x with copy *a* in default and copy *b* in device."""
+    root = fleet({"default": {"t/x": a}, "device": {"t/x": b}})
+    return root, _groups(root)["x"]
+
+
+_PROBE_CASES = {
+    "file only in A, lines elsewhere in B": (
+        {"SKILL.md": _MD, "scripts/run.sh": "step one do this\n"},
+        {"SKILL.md": _MD_PLUS},
+    ),
+    "empty file only in A": ({"SKILL.md": _MD, "scripts/__init__.py": ""}, {"SKILL.md": _MD_PLUS}),
+    "short-line script only in A": (
+        {"SKILL.md": _MD, "scripts/a.sh": "ls\ncd\nfi\n"},
+        {"SKILL.md": _MD_PLUS},
+    ),
+    "reordered": ({"SKILL.md": skill_md("x", "d", _BASE[::-1])}, {"SKILL.md": _MD_PLUS}),
+    "indent change python": (
+        {"SKILL.md": _MD, "s.py": "if True:\n    do_thing()\n"},
+        {"SKILL.md": skill_md("x", "d", [*_BASE, "extra"]), "s.py": "if True:\ndo_thing()\n"},
+    ),
+    "dup line removed": (
+        {"SKILL.md": skill_md("x", "d", [*_BASE, "retry the command", "retry the command"])},
+        {"SKILL.md": skill_md("x", "d", [*_BASE, "retry the command", "extra"])},
+    ),
+    "renamed file": (
+        {"SKILL.md": _MD, "references/a.md": "ref content line\n"},
+        {"SKILL.md": _MD + "more\n", "references/b.md": "ref content line\n"},
+    ),
+    "code fence lang": (
+        {"SKILL.md": _MD + "```python\ncode line here\n```\n"},
+        {"SKILL.md": _MD + "```\ncode line here\n```\nextra line\n"},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_PROBE_CASES))
+def test_lossy_copies_are_conflicts(fleet, case):
+    a, b = _PROBE_CASES[case]
+    _, g = _pair(fleet, a, b)
+    assert g.status == "conflict", case
+    assert g.keep is None
+
+
+def test_file_only_in_one_copy_is_listed(fleet):
+    a, b = _PROBE_CASES["renamed file"]
+    _, g = _pair(fleet, a, b)
+    assert g.unique_files == {"default:t/x": ["references/a.md"], "device:t/x": ["references/b.md"]}
+    assert g.unique_lines == {"default:t/x": 1, "device:t/x": 2}
+
+
+def test_duplicate_lines_count_as_unique(fleet):
+    a, b = _PROBE_CASES["dup line removed"]
+    _, g = _pair(fleet, a, b)
+    assert g.unique_lines == {"default:t/x": 1, "device:t/x": 1}
+    assert g.unique_files == {"default:t/x": [], "device:t/x": []}
+
+
+def test_superset_in_every_file_is_contained(fleet):
+    a = {"SKILL.md": _MD, "references/r.md": "ref one\nref two\n", "assets/i.bin": b"\x00img"}
+    b = {
+        "SKILL.md": skill_md("x", "d", ["intro line", _BASE[0], "middle", _BASE[1], "outro"]),
+        "references/r.md": "ref one\nnew ref\nref two\n",
+        "references/new.md": "only in b\n",
+        "assets/i.bin": b"\x00img",
+    }
+    _, g = _pair(fleet, a, b)
+    assert g.status == "contained"
+    assert g.keep is not None and g.keep.id == "device:t/x"
+
+
+def test_version_bump_only_is_contained(fleet):
+    a = {"SKILL.md": "---\nname: x\nversion: 1.0.0\nupdated: 2026-01-01\n---\nbody line\n"}
+    b = {"SKILL.md": "---\nname: x\nversion: 1.1.0\nlast_updated: 2026-02-02\n---\nbody line\n"}
+    _, g = _pair(fleet, a, b)
+    assert g.status == "contained"
+    assert g.keep is not None and g.keep.id == "default:t/x"
+
+
+def test_crlf_only_difference_is_contained(fleet):
+    a = {"SKILL.md": _MD.replace("\n", "\r\n"), "s.sh": "echo a\r\n"}
+    b = {"SKILL.md": _MD, "s.sh": "echo a\n"}
+    _, g = _pair(fleet, a, b)
+    assert g.status == "contained"
+
+
+def test_trailing_whitespace_only_difference_is_contained(fleet):
+    a = {"SKILL.md": _MD.replace("do this", "do this  \t"), "s.py": "x = 1   \n"}
+    b = {"SKILL.md": _MD, "s.py": "x = 1\n"}
+    _, g = _pair(fleet, a, b)
+    assert g.status == "contained"
+
+
+def test_missing_final_newline_is_contained(fleet):
+    a = {"SKILL.md": _MD.rstrip("\n")}
+    b = {"SKILL.md": _MD}
+    _, g = _pair(fleet, a, b)
+    assert g.status == "contained"
+
+
+def test_executable_bit_only_in_smaller_copy_is_conflict(fleet):
+    a = {"SKILL.md": _MD, "scripts/run.sh": "echo run\n"}
+    b = {"SKILL.md": _MD_PLUS, "scripts/run.sh": "echo run\n"}
+    root, _ = _pair(fleet, a, b)
+    os.chmod(root / "skills/t/x/scripts/run.sh", 0o755)
+    assert _groups(root)["x"].status == "conflict"
+
+
+def test_executable_bit_difference_breaks_identical(fleet):
+    files = {"SKILL.md": _MD, "scripts/run.sh": "echo run\n"}
+    root, g = _pair(fleet, dict(files), dict(files))
+    assert g.status == "identical"
+    os.chmod(root / "profiles/device/skills/t/x/scripts/run.sh", 0o755)
+    assert _groups(root)["x"].status == "conflict"
+
+
+def test_inner_symlink_targets_must_match(fleet):
+    root, _ = _pair(fleet, {"SKILL.md": _MD}, {"SKILL.md": _MD_PLUS})
+    (root / "skills/t/x/link").symlink_to("SKILL.md")
+    (root / "profiles/device/skills/t/x/link").symlink_to("other.md")
+    assert _groups(root)["x"].status == "conflict"
+    (root / "profiles/device/skills/t/x/link").unlink()
+    (root / "profiles/device/skills/t/x/link").symlink_to("SKILL.md")
+    assert _groups(root)["x"].status == "contained"
+
+
+def test_frontmatter_exemption_only_in_leading_block(fleet):
+    a = {"SKILL.md": _MD + "version: 2 in the body\n"}
+    b = {"SKILL.md": _MD_PLUS}
+    _, g = _pair(fleet, a, b)
+    assert g.status == "conflict"
