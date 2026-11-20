@@ -12,15 +12,23 @@ Grouping reads its own content view of each copy (see _content), not the
 scan.tree_hash walk: tree_hash mirrors Hermes and skips EXCLUDED_SKILL_DIRS
 and all *.pyc/*.pyo, but a retired copy loses those files too, so here only
 regenerable runtime caches are ignored and everything else (.git, .github,
-node_modules, .venv, ...) counts, compared byte for byte. The only accepted
-losses are the three text normalizations of _text_lines: trailing spaces,
-tabs and CRs stripped, CRLF read as LF, and SKILL.md frontmatter version:,
-updated: and last_updated: lines ignored; merge --accept and the setup
-backups cover them.
+node_modules, .venv, ...) counts, compared byte for byte. Directories count
+too: a folder (empty or not) that only one copy has is content. The only
+accepted normalizations, for containment only, are those of _text_lines:
+
+- CRLF read as LF;
+- trailing spaces, tabs and CRs stripped from each line;
+- in SKILL.md, frontmatter version:, updated: and last_updated: lines ignored.
+
+Whether a non-empty text file ends with a newline is NOT normalized: copies
+that differ in it are neither contained nor identical. 'identical' compares
+raw bytes and so accepts no normalization at all. merge --accept and the
+setup backups cover the accepted ones.
 """
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import os
 import re
@@ -49,7 +57,6 @@ _OPAQUE_DIRS = EXCLUDED_SKILL_DIRS - _RUNTIME_CACHE_DIRS
 _BYTECODE_SUFFIXES = (".pyc", ".pyo")
 _CHUNK = 1 << 20
 
-_SNIFF = 8 * 1024
 _TRAILING_WS = " \t\r"
 _VOLATILE_KEY = re.compile(r"^(version|updated|last_updated):")
 
@@ -79,8 +86,8 @@ def is_movable(copy: SkillCopy) -> bool:
 
 
 def is_text(data: bytes) -> bool:
-    """True unless *data* has a NUL in its first 8 KiB or is not strict UTF-8."""
-    if b"\0" in data[:_SNIFF]:
+    """True unless *data* has a NUL anywhere or is not strict UTF-8."""
+    if b"\0" in data:
         return False
     try:
         data.decode("utf-8")
@@ -89,16 +96,51 @@ def is_text(data: bytes) -> bool:
     return True
 
 
-def _text_lines(data: bytes, skill_md: bool) -> tuple[str, ...]:
+def _read_stream(full: str) -> tuple[str, str | None]:
+    """(sha256 of the bytes, decoded text or None when binary), reading 1 MiB chunks.
+
+    Binary means a NUL anywhere or invalid strict UTF-8. Once a file is known
+    to be binary its text is dropped and the rest is only hashed.
+    """
+    h = hashlib.sha256()
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    parts: list[str] | None = []
+    with open(full, "rb") as fh:
+        while chunk := fh.read(_CHUNK):
+            h.update(chunk)
+            if parts is None:
+                continue
+            if b"\0" in chunk:
+                parts = None
+                continue
+            try:
+                parts.append(decoder.decode(chunk))
+            except UnicodeDecodeError:
+                parts = None
+    if parts is not None:
+        try:
+            parts.append(decoder.decode(b"", final=True))
+        except UnicodeDecodeError:
+            parts = None
+    return h.hexdigest(), None if parts is None else "".join(parts)
+
+
+def is_text_file(path: Path) -> bool:
+    """is_text for a file on disk, streamed in chunks (a NUL anywhere makes it binary)."""
+    return _read_stream(os.fspath(path))[1] is not None
+
+
+def _text_lines(text: str, skill_md: bool) -> tuple[str, ...]:
     """Lines of a text file as compared for containment.
 
-    CRLF becomes LF, a final newline does not make an extra empty line, and
-    only trailing spaces, tabs and CRs are stripped: indentation, blank lines,
-    short lines and code-fence tags all count. In SKILL.md only, lines of the
-    leading --- block whose key is version:, updated: or last_updated: are
-    dropped, since a version bump alone loses nothing.
+    CRLF becomes LF, a final newline does not make an extra empty line (its
+    presence is tracked apart, see _File.final_newline), and only trailing
+    spaces, tabs and CRs are stripped: indentation, blank lines, short lines
+    and code-fence tags all count. In SKILL.md only, lines of the leading ---
+    block whose key is version:, updated: or last_updated: are dropped, since
+    a version bump alone loses nothing.
     """
-    text = data.decode("utf-8").replace("\r\n", "\n")
+    text = text.replace("\r\n", "\n")
     raw = text.split("\n")
     if raw and raw[-1] == "":
         raw.pop()
@@ -112,10 +154,14 @@ def _text_lines(data: bytes, skill_md: bool) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class _File:
-    kind: Literal["text", "binary", "link"]
+    kind: Literal["text", "binary", "link", "dir"]
     executable: bool
     lines: tuple[str, ...] = ()  # text files only
     digest: str = ""  # sha256 of the bytes (files) or of the link target (link)
+    final_newline: bool = False  # text files only: the bytes end with a newline
+
+
+_DIR = _File("dir", False)
 
 
 def _is_executable(full: str) -> bool:
@@ -131,13 +177,12 @@ def _read_opaque(full: str) -> _File:
 
 
 def _read_file(rel: str, full: str) -> _File:
-    with open(full, "rb") as fh:
-        data = fh.read()
+    digest, text = _read_stream(full)
     executable = _is_executable(full)
-    digest = hashlib.sha256(data).hexdigest()
-    if is_text(data):
-        return _File("text", executable, lines=_text_lines(data, rel == SKILL_FILE), digest=digest)
-    return _File("binary", executable, digest=digest)
+    if text is None:
+        return _File("binary", executable, digest=digest)
+    lines = _text_lines(text, rel == SKILL_FILE)
+    return _File("text", executable, lines=lines, digest=digest, final_newline=text.endswith("\n"))
 
 
 def _is_runtime_bytecode(full: str) -> bool:
@@ -147,7 +192,7 @@ def _is_runtime_bytecode(full: str) -> bool:
 
 
 def _content_entries(top: str) -> list[tuple[str, str, str]]:
-    """(rel, kind, path) of every file ('F') and inner symlink ('L') but runtime caches.
+    """(rel, kind, path) of every file ('F'), folder ('D') and inner symlink ('L') but runtime caches.
 
     Unlike scan._hash_entries, which mirrors Hermes hashing, this keeps every
     EXCLUDED_SKILL_DIRS entry except _RUNTIME_CACHE_DIRS and keeps source-less
@@ -163,6 +208,7 @@ def _content_entries(top: str) -> list[tuple[str, str, str]]:
             if os.path.islink(full):
                 entries.append((os.path.relpath(full, top).replace(os.sep, "/"), "L", full))
             elif d not in _RUNTIME_CACHE_DIRS:
+                entries.append((os.path.relpath(full, top).replace(os.sep, "/") + "/", "D", full))
                 keep.append(d)
         dirnames[:] = keep
         for fname in filenames:
@@ -179,6 +225,8 @@ def _content_entries(top: str) -> list[tuple[str, str, str]]:
 def _content(directory: Path) -> dict[str, _File]:
     """The grouping view of a skill tree: every entry of _content_entries by POSIX rel path.
 
+    Folders are keyed by their rel path plus a trailing '/', so they never
+    collide with a file of the same name.
     A file under an _OPAQUE_DIRS dir (.git, node_modules, ...) is read
     as binary whatever its bytes, so it only counts as contained when the
     bytes match exactly. Non-regular files (FIFOs, sockets) are skipped as in
@@ -189,6 +237,8 @@ def _content(directory: Path) -> dict[str, _File]:
         if kind == "L":
             target = os.readlink(full).encode("utf-8", "surrogateescape")
             out[rel] = _File("link", False, digest=hashlib.sha256(target).hexdigest())
+        elif kind == "D":
+            out[rel] = _DIR
         elif stat.S_ISREG(os.lstat(full).st_mode):
             opaque = any(part in _OPAQUE_DIRS for part in rel.split("/")[:-1])
             out[rel] = _read_opaque(full) if opaque else _read_file(rel, full)
@@ -214,10 +264,10 @@ def file_lines(path: Path) -> Counter[str]:
     for a binary file and OSError when it cannot be read.
     """
     path = Path(path)
-    data = path.read_bytes()
-    if not is_text(data):
+    _, text = _read_stream(os.fspath(path))
+    if text is None:
         raise ValueError(f"not a text file: {path}")
-    return Counter(_text_lines(data, path.name == SKILL_FILE))
+    return Counter(_text_lines(text, path.name == SKILL_FILE))
 
 
 def _is_subsequence(small: tuple[str, ...], big: tuple[str, ...]) -> bool:
@@ -229,6 +279,9 @@ def _file_contained(a: _File, b: _File) -> bool:
     if a.kind != b.kind or a.executable != b.executable:
         return False
     if a.kind == "text":
+        # An empty file has no final newline to lose; any other difference in it counts.
+        if a.lines and a.final_newline != b.final_newline:
+            return False
         return _is_subsequence(a.lines, b.lines)
     return a.digest == b.digest
 
@@ -236,11 +289,12 @@ def _file_contained(a: _File, b: _File) -> bool:
 def _contained(a: dict[str, _File], b: dict[str, _File]) -> bool:
     """True when copy *a* loses nothing if only copy *b* is kept.
 
-    Per file: every rel path of *a* exists in *b* (empty files too, so a
-    renamed or added file is never contained), with the same kind and the
-    same executable bit; binaries and inner symlinks must be identical;
-    a text file's lines must appear in *b*'s file of the same path in the
-    same order, with any lines inserted around them. Requiring order is a
+    Per entry: every rel path of *a* exists in *b* (empty files and folders
+    too, so a renamed or added file or folder is never contained), with the
+    same kind and the same executable bit; binaries and inner symlinks must
+    be identical; a non-empty text file must agree on ending with a newline,
+    and its lines must appear in *b*'s file of the same path in the same
+    order, with any lines inserted around them. Requiring order is a
     deliberate choice over a plain multiset check: a copy whose steps were
     reordered is a different skill, and soundness beats recall here, since a
     false 'contained' retires a copy. merge --accept is the second check.
@@ -267,6 +321,10 @@ def _unique(c: str, survivors: list[str], contents: dict[str, dict[str, _File]])
             if rel in o and o[rel].kind == "text":
                 seen |= Counter(o[rel].lines)
         lines += sum((Counter(f.lines) - seen).values())
+    # A folder is listed only when nothing listed lies below it (the deepest entry says more).
+    only = [
+        rel for rel in only if not (rel.endswith("/") and any(o != rel and o.startswith(rel) for o in only))
+    ]
     return lines, sorted(only)
 
 

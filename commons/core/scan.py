@@ -81,6 +81,23 @@ def _describe(exc: OSError, rel: str) -> str:
     return f"unreadable: {rel}: {reason}"
 
 
+UNDECODABLE = "undecodable filename"
+
+
+def is_undecodable(name: str) -> bool:
+    """True when a name os.walk returned is not valid UTF-8 (it carries surrogate escapes)."""
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def _rel_bytes(rel: str) -> bytes:
+    """A relpath as its raw file system bytes, so a non-UTF-8 name hashes instead of raising."""
+    return os.fsencode(rel)
+
+
 def _hash_entries(directory: Path) -> tuple[list[tuple[str, str, str]], str | None]:
     """List (rel, kind, path) for hashing, kind 'F' file or 'L' symlink; plus the first walk error."""
     entries: list[tuple[str, str, str]] = []
@@ -116,7 +133,7 @@ def _hash_file(h, rel: str, full: str) -> None:
         return
     with open(full, "rb") as fh:
         size = os.fstat(fh.fileno()).st_size
-        h.update(rel.encode("utf-8") + b"\0" + str(size).encode() + b"\0")
+        h.update(_rel_bytes(rel) + b"\0" + str(size).encode() + b"\0")
         seen = 0
         while chunk := fh.read(_CHUNK):
             seen += len(chunk)
@@ -125,22 +142,23 @@ def _hash_file(h, rel: str, full: str) -> None:
         raise OSError(errno.EIO, "changed while hashing", full)
 
 
-def _tree_hash(directory: Path) -> tuple[str, str | None]:
-    """Return (hash, error); hash is '' whenever any part of the tree could not be read."""
+def _tree_hash(directory: Path) -> tuple[str, str | None, bool]:
+    """Return (hash, error, has an undecodable name); hash is '' whenever any part could not be read."""
     entries, error = _hash_entries(Path(directory))
+    undecodable = any(is_undecodable(rel) for rel, _, _ in entries)
     if error:
-        return "", error
+        return "", error, undecodable
     h = hashlib.sha256()
     for rel, kind, full in sorted(entries):
         try:
             if kind == "L":
                 target = os.readlink(full).encode("utf-8", "surrogateescape")
-                h.update(rel.encode("utf-8") + b"\0L" + str(len(target)).encode() + b"\0" + target)
+                h.update(_rel_bytes(rel) + b"\0L" + str(len(target)).encode() + b"\0" + target)
             else:
                 _hash_file(h, rel, full)
         except OSError as exc:
-            return "", _describe(exc, rel)
-    return h.hexdigest(), None
+            return "", _describe(exc, rel), undecodable
+    return h.hexdigest(), None, undecodable
 
 
 def tree_hash(directory: Path) -> str:
@@ -150,6 +168,8 @@ def tree_hash(directory: Path) -> str:
     bytes, so different trees cannot collide. EXCLUDED_SKILL_DIRS and
     *.pyc/*.pyo are skipped. A symlink inside the tree is recorded as 'L' plus
     its target text and never followed; the top folder itself may be a symlink.
+    Names are hashed as their raw bytes (os.fsencode), so a name that is not
+    valid UTF-8 hashes like any other instead of raising.
     """
     return _tree_hash(directory)[0]
 
@@ -291,30 +311,43 @@ def _classify(
     found: _Found,
     name: str,
     error: str | None,
+    undecodable: bool,
     manifest: dict[str, str],
     lock: dict[str, dict],
     md5_dir_hash: Callable[[Path], str],
     hub_hash: Callable[[Path], str],
-) -> tuple[Kind, str | None]:
-    """Return (kind, origin_hash). An unreadable tree can never be proven pristine."""
+) -> tuple[Kind, str | None, str | None]:
+    """Return (kind, origin_hash, error). An unreadable tree can never be proven pristine.
+
+    A bundled or hub copy holding a non-UTF-8 file name gets error
+    UNDECODABLE: Hermes tools/skills_sync.py dir_hash and
+    tools/skills_guard.py content_hash both encode relpaths as UTF-8 and
+    raise UnicodeEncodeError on it (tests/test_core_scan.py runs them), so
+    neither Hermes nor commons can compare the copy with its origin. Hermes
+    still loads and lists such a skill, so an 'own' copy is hashed normally.
+    """
     if found.via_symlink:
-        return "symlink", None
+        return "symlink", None, error
     # Mirror of Hermes tools/skill_usage.py is_bundled: the resolved name only.
     if name in manifest:
         origin = manifest[name]
+        if undecodable:
+            return "bundled-edited", origin, error or UNDECODABLE
         # An empty origin is a v1 entry: Hermes _update_existing_skill
         # re-baselines it from the user's copy, so it counts as pristine.
         if error is None and (origin == "" or md5_dir_hash(found.path) == origin):
-            return "bundled-pristine", origin
-        return "bundled-edited", origin
+            return "bundled-pristine", origin, error
+        return "bundled-edited", origin, error
     entry = _hub_entry(lock, name, found.rel)
     if entry is not None:
         recorded = entry.get("content_hash")
         origin = recorded if isinstance(recorded, str) else None
+        if undecodable:
+            return "hub-edited", origin, error or UNDECODABLE
         if error is None and origin is not None and hub_hash(found.path) == origin:
-            return "hub-pristine", origin
-        return "hub-edited", origin
-    return "own", None
+            return "hub-pristine", origin, error
+        return "hub-edited", origin, error
+    return "own", None, error
 
 
 def scan_profile(
@@ -347,8 +380,10 @@ def scan_root(
     for found in _walk_skill_dirs(skills_dir):
         path = found.path
         name = read_skill_name(path / SKILL_FILE, path.name)
-        digest, error = _tree_hash(path)
-        kind, origin = _classify(found, name, error, manifest, lock, md5_dir_hash, hub_hash)
+        digest, error, undecodable = _tree_hash(path)
+        kind, origin, error = _classify(
+            found, name, error, undecodable, manifest, lock, md5_dir_hash, hub_hash
+        )
         target = Path(os.path.realpath(path)) if os.path.islink(path) else None
         copies.append(
             SkillCopy(

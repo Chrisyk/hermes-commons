@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 
 from commons.core.fleet import discover
-from commons.core.group import file_lines, group, is_text
+from commons.core.group import file_lines, group, is_text, is_text_file
 from commons.core.scan import scan_profile
 from tests.fleet import dir_hash_md5, hub_content_hash, skill_md, write_files
 
@@ -279,7 +279,29 @@ def test_is_text():
     assert not is_text(b"a\x00b")
     assert not is_text(b"\xff\xfe broken")
     assert not is_text(b"x" * 9000 + b"\xff")
+    assert not is_text(b"x" * 9000 + b"\x00")
     assert is_text(b"")
+
+
+def test_is_text_file_streams_and_sees_late_nul(tmp_path):
+    late = tmp_path / "late.txt"
+    late.write_bytes(b"line\n" * 700_000 + b"\x00")
+    assert not is_text_file(late)
+    # A multibyte char split across the 1 MiB read boundary is still text.
+    split = tmp_path / "split.txt"
+    split.write_bytes(b"a" * (1024 * 1024 - 1) + "\u00e9".encode() + b"\n")
+    assert is_text_file(split)
+    bad = tmp_path / "bad.txt"
+    bad.write_bytes(b"a" * (2 * 1024 * 1024) + b"\xc3")
+    assert not is_text_file(bad)
+
+
+def test_nul_after_first_8k_makes_the_file_binary(fleet):
+    body = "line of text\n" * 1000
+    a = {"SKILL.md": _MD, "data.txt": body + "\x00"}
+    b = {"SKILL.md": _MD_PLUS, "data.txt": body + "more\n\x00"}
+    _, g = _pair(fleet, a, b)
+    assert g.status == "conflict"
 
 
 # Containment is per file: every file of the smaller copy must exist in the bigger
@@ -383,11 +405,67 @@ def test_trailing_whitespace_only_difference_is_contained(fleet):
     assert g.status == "contained"
 
 
-def test_missing_final_newline_is_contained(fleet):
-    a = {"SKILL.md": _MD.rstrip("\n")}
-    b = {"SKILL.md": _MD}
-    _, g = _pair(fleet, a, b)
+@pytest.mark.parametrize("which", ["smaller lacks it", "bigger lacks it"])
+def test_final_newline_difference_is_not_contained(fleet, which):
+    a, b = _MD, _MD_PLUS
+    if which == "smaller lacks it":
+        a = a.rstrip("\n")
+    else:
+        b = b.rstrip("\n")
+    _, g = _pair(fleet, {"SKILL.md": a}, {"SKILL.md": b})
+    assert g.status == "conflict"
+    assert g.keep is None
+
+
+def test_final_newline_only_difference_is_not_identical(fleet):
+    _, g = _pair(fleet, {"SKILL.md": _MD, "n.txt": "x\n"}, {"SKILL.md": _MD, "n.txt": "x"})
+    assert g.status == "conflict"
+
+
+def test_crlf_final_newline_counts_as_a_final_newline(fleet):
+    _, g = _pair(fleet, {"SKILL.md": _MD, "n.txt": "x\r\n"}, {"SKILL.md": _MD_PLUS, "n.txt": "x\n"})
     assert g.status == "contained"
+
+
+def test_empty_dir_only_in_smaller_copy_is_conflict(fleet):
+    root, _ = _pair(fleet, {"SKILL.md": _MD}, {"SKILL.md": _MD_PLUS})
+    (root / "skills/t/x/references/empty").mkdir(parents=True)
+    g = _groups(root)["x"]
+    assert g.status == "conflict"
+    assert g.unique_files["default:t/x"] == ["references/empty/"]
+
+
+def test_empty_dir_only_in_bigger_copy_is_contained(fleet):
+    root, _ = _pair(fleet, {"SKILL.md": _MD}, {"SKILL.md": _MD_PLUS})
+    (root / "profiles/device/skills/t/x/empty").mkdir()
+    g = _groups(root)["x"]
+    assert g.status == "contained"
+    assert g.keep is not None and g.keep.id == "device:t/x"
+
+
+def test_empty_dir_breaks_identical(fleet):
+    files = {"SKILL.md": _MD}
+    root, g = _pair(fleet, dict(files), dict(files))
+    assert g.status == "identical"
+    (root / "skills/t/x/empty").mkdir()
+    g = _groups(root)["x"]
+    assert g.status == "contained"
+    assert g.keep is not None and g.keep.id == "default:t/x"
+
+
+def test_empty_runtime_cache_dir_is_ignored(fleet):
+    files = {"SKILL.md": _MD}
+    root, _ = _pair(fleet, dict(files), dict(files))
+    (root / "skills/t/x/__pycache__").mkdir()
+    assert _groups(root)["x"].status == "identical"
+
+
+def test_undecodable_filename_in_own_copies(fleet):
+    bad = os.fsdecode(b"bad\xff.txt")
+    root, _ = _pair(fleet, {"SKILL.md": _MD}, {"SKILL.md": _MD})
+    for home in (root, root / "profiles" / "device"):
+        (home / "skills" / "t" / "x" / bad).write_bytes(b"x\n")
+    assert _groups(root)["x"].status == "identical"
 
 
 def test_executable_bit_only_in_smaller_copy_is_conflict(fleet):

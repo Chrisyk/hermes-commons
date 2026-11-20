@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from commons.core.fleet import discover
 from commons.core.scan import read_manifest, read_skill_name, scan_profile, tree_hash
 from tests.fleet import dir_hash_md5, hub_content_hash, skill_md, write_files
+from tests.test_hash_fidelity import _hermes_python, _hermes_src
 
 
 def _scan(root, name):
@@ -445,3 +447,85 @@ def test_unreadable_dirs_do_not_crash(classic_fleet, chmod_000):
     assert copies["general/same"].tree_hash == ""
     assert copies["general/conflict"].error is None
     assert "locked/hidden" not in copies
+
+
+# A file name that is not valid UTF-8 (one raw 0xff byte), as os.walk returns it.
+_BAD = os.fsdecode(b"bad\xff.txt")
+
+
+def test_undecodable_filename_in_own_skill_is_hashed(classic_fleet):
+    skill = classic_fleet / "skills" / "general" / "conflict"
+    before = _by_rel(_scan(classic_fleet, "default"))["general/conflict"].tree_hash
+    (skill / _BAD).write_bytes(b"x\n")
+    copy = _by_rel(_scan(classic_fleet, "default"))["general/conflict"]
+    assert copy.error is None
+    assert copy.kind == "own"
+    assert copy.tree_hash not in ("", before)
+    (skill / _BAD).rename(skill / os.fsdecode(b"bad\xfe.txt"))
+    assert _by_rel(_scan(classic_fleet, "default"))["general/conflict"].tree_hash not in ("", copy.tree_hash)
+
+
+def test_undecodable_filename_in_bundled_or_hub_copy_is_an_error(classic_fleet):
+    skills = classic_fleet / "skills"
+    for rel in ("bundled/bundled-pristine", "tools/hubskill"):
+        (skills / rel / _BAD).write_bytes(b"x\n")
+    copies = _by_rel(_scan(classic_fleet, "default"))
+    assert copies["bundled/bundled-pristine"].error == "undecodable filename"
+    assert copies["bundled/bundled-pristine"].kind == "bundled-edited"
+    assert copies["tools/hubskill"].error == "undecodable filename"
+    assert copies["tools/hubskill"].kind == "hub-edited"
+    assert copies["general/same"].error is None
+
+
+_UNDECODABLE_PROBE = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import hermes_bootstrap  # noqa: F401
+from pathlib import Path
+from tools.skills_guard import content_hash
+from tools.skills_sync import dir_hash
+from tools.skills_tool import skill_view, skills_list
+skill = Path(sys.argv[2])
+out = {
+    "view": json.loads(skill_view("odd")).get("success"),
+    "listed": [s["name"] for s in json.loads(skills_list())["skills"]],
+}
+for label, fn in (("dir_hash", dir_hash), ("content_hash", content_hash)):
+    try:
+        fn(skill)
+        out[label] = "ok"
+    except UnicodeEncodeError:
+        out[label] = "UnicodeEncodeError"
+print(json.dumps(out))
+"""
+
+
+def test_real_hermes_loads_but_cannot_hash_undecodable_names(tmp_path):
+    """Why only bundled and hub copies get the error: Hermes loads the skill, its hashes raise."""
+    python, src = _hermes_python(), _hermes_src()
+    if python is None or src is None:
+        pytest.skip("no Hermes runtime python or Hermes source checkout found")
+    home = tmp_path / "hermes"
+    skill = home / "skills" / "odd"
+    write_files(skill, {"SKILL.md": skill_md("odd", "d", ["body"])})
+    (skill / _BAD).write_bytes(b"x\n")
+    work = tmp_path / "cwd"
+    work.mkdir()
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(work), "HERMES_HOME": str(home)}
+    proc = subprocess.run(
+        [str(python), "-I", "-c", _UNDECODABLE_PROBE, str(src), os.fsencode(skill)],
+        check=False,
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    real = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert real == {
+        "view": True,
+        "listed": ["odd"],
+        "dir_hash": "UnicodeEncodeError",
+        "content_hash": "UnicodeEncodeError",
+    }
