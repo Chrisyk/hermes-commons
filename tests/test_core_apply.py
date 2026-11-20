@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from commons.core import apply as apply_mod
-from commons.core.apply import ApplyResult, apply, load_journal
+from commons.core.apply import ApplyResult, apply, intents, load_journal
 from commons.core.configio import YamlFileWriter
 from commons.core.fleet import discover
 from commons.core.gitrepo import GitRepo
@@ -78,9 +78,18 @@ def test_apply_classic_fleet(classic_fleet):
         assert {f.relative_to(dest): f.read_bytes() for f in dest.rglob("*") if f.is_file()} == files
     journal = load_journal(lay, bid)
     assert journal["complete"] is True and journal["error"] is None
-    assert len(journal["retired"]) == 8
-    assert journal["steps"][:2] == ["backup", "git"]
-    assert journal["steps"][-2:] == ["paths", "commons-config"]
+    assert len(intents(journal, "retire")) == 8
+    assert all(i["state"] == "done" for i in intents(journal))
+    assert journal["steps"] == [
+        "backup",
+        "git",
+        "copy",
+        "commit",
+        "config",
+        "retire",
+        "paths",
+        "commons-config",
+    ]
     repo = GitRepo(shared)
     subjects = [s for _, _, s in repo.log()]
     assert subjects == ["commons: record setup", "commons setup 2026-11-20T12:00:00Z"]
@@ -90,14 +99,21 @@ def test_apply_classic_fleet(classic_fleet):
     assert result.steps_done == journal["steps"]
 
 
-def test_journal_records_config_hashes(classic_fleet):
+def test_journal_records_config_intents(classic_fleet):
     result = run_apply(classic_fleet)
     journal = load_journal(layout_for(classic_fleet), result.backup_id)
     for p in discover(classic_fleet):
-        rec = journal["profiles"][p.name]
-        assert rec["config_before_sha256"] != rec["config_after_sha256"]
-        assert rec["create_dir_set"] is True and rec["create_dir_old"] is None
-        assert rec["plugin_added"] is True
+        before = journal["profiles"][p.name]["config_before_sha256"]
+        mine = [
+            i for i in intents(journal) if i["args"].get("profile") == p.name and i["op"].startswith("config")
+        ]
+        assert [i["op"] for i in mine] == ["config_set", "config_list_add"]
+        cset, cadd = (i["args"] for i in mine)
+        assert cset["old_value_present"] is False and cset["old_value"] is None
+        assert cadd["was_present"] is False and cadd["item"] == "commons"
+        assert before != cset["config_sha256_after"] != cadd["config_sha256_after"]
+        retire = intents(journal, "retire")[0]["args"]
+        assert retire["fingerprint"] and Path(retire["dst"]).is_dir()
 
 
 def test_forced_failure_at_second_retire(classic_fleet, monkeypatch):
@@ -113,15 +129,15 @@ def test_forced_failure_at_second_retire(classic_fleet, monkeypatch):
     monkeypatch.setattr(apply_mod, "retire", flaky)
     result = run_apply(classic_fleet)
     assert result.error and "disk on fire" in result.error
-    retires = [s for s in result.steps_done if s.startswith("retire ")]
-    assert len(retires) == 1
     journal = load_journal(layout_for(classic_fleet), result.backup_id)
-    assert journal["steps"] == result.steps_done
-    assert len(journal["retired"]) == 1
+    assert journal["steps"] == result.steps_done == ["backup", "git", "copy", "commit", "config"]
+    retires = intents(journal, "retire")
+    assert [i["state"] for i in retires] == ["done", "pending"]
     assert journal["complete"] is False and "disk on fire" in journal["error"]
-    first = journal["retired"][0]
-    assert Path(first["retired_path"]).is_dir()
-    assert not Path(first["path"]).exists()
+    first = retires[0]["args"]
+    assert Path(first["dst"]).is_dir()
+    assert not Path(first["src"]).exists()
+    assert Path(retires[1]["args"]["src"]).is_dir()
 
 
 def test_keep_choice_moves_conflict(classic_fleet):
@@ -138,7 +154,9 @@ def test_existing_different_target_fails_before_any_retire(classic_fleet):
     write_files(classic_fleet / "shared" / "general" / "same", {"SKILL.md": skill_md("other", "d", ["x"])})
     result = run_apply(classic_fleet, prop)
     assert result.error and "different content" in result.error
-    assert not any(s.startswith(("retire", "config")) for s in result.steps_done)
+    assert result.steps_done == ["backup", "git"]
+    journal = load_journal(layout_for(classic_fleet), result.backup_id)
+    assert not intents(journal, "retire") and not intents(journal, "config_set")
     assert (classic_fleet / "skills" / "general" / "same").is_dir()
 
 
@@ -152,7 +170,7 @@ def test_identical_existing_target_is_skipped(classic_fleet):
     result = run_apply(classic_fleet, prop)
     assert result.error is None
     journal = load_journal(layout_for(classic_fleet), result.backup_id)
-    assert [c["skipped"] for c in journal["copied"] if c["name"] == "same"] == [True]
+    assert [c["args"]["skipped"] for c in intents(journal, "copy") if c["args"]["name"] == "same"] == [True]
 
 
 def test_uncommitted_shared_state_is_snapshotted_first(classic_fleet):
@@ -202,9 +220,10 @@ def test_cron_and_reference_rewrites(classic_fleet):
         encoding="utf-8"
     ) == f"{shared}/general/same\n"
     journal = load_journal(layout_for(root), result.backup_id)
-    assert [c["profile"] for c in journal["cron"]] == ["pikvm"]
-    assert Path(journal["cron"][0]["backup_path"]).read_bytes() == before
-    assert len(journal["file_rewrites"]) == 1
+    cron = intents(journal, "cron_write")
+    assert [c["args"]["profile"] for c in cron] == ["pikvm"]
+    assert Path(cron[0]["args"]["backup_copy"]).read_bytes() == before
+    assert len(intents(journal, "md_write")) == 1
     assert GitRepo(shared).status_porcelain() == []
 
 

@@ -1,53 +1,74 @@
-"""Undo a setup surgically, from its journal, without losing work done since.
+"""Undo a setup surgically, from its write-ahead journal, without losing work done since.
 
-plan_restore reads journal.json and lists what apply recorded: the profile
-configs it changed, the copies it retired, the cron files it rewrote, plus
-what happened in the shared root since setup (skills created or changed
-after setup's last commit) and which restored copies would shadow a shared
-copy again (a profile that still reads the shared root after restore).
+plan_restore reads journal.json and turns every intent apply wrote, pending
+or done, into something restore can undo. It never trusts the intent state
+alone: for each one it looks at the file system to decide whether the action
+actually happened (see _retire_state, _config_state, _sha_state), so a crash
+between an action and its journal entry is undone exactly. Whatever cannot
+be decided is reported, never guessed.
 
-restore() first takes a 'pre-restore' backup, then:
+restore() takes the shared root's git lock for its whole run (it does not
+modify the shared root, but must not race a hook commit or an apply), checks
+the setup backup with verify_backup (problems are reported, restore goes
+on), takes a 'pre-restore' backup, then:
 
-- config.yaml: if its sha256 still equals the one apply recorded after its
-  change, the backed-up file is written back byte for byte (atomic, fsync,
-  mode kept); otherwise only the keys commons changed are reverted
-  (skills.create_dir back to its old value or unset, if it still points at
-  the shared root; 'commons' out of plugins.enabled, if commons added it)
-  and that is reported;
-- copy_new_to: the named shared skills are copied into the chosen
-  profiles (before the put-back below, so the user's choice wins);
-- retired copies are moved back to where they were; if something is there
-  now, the copy stays in the backup and that is reported;
-- cron jobs.json: written back the same sha-or-report way, under Hermes'
-  cron lock; if it changed since, it is left alone and reported.
+- config.yaml: if it is as setup left it (its sha256 is one apply recorded,
+  or its parsed content equals the pre-setup config plus a prefix of the
+  journaled config changes, which covers a crash mid-change), the backed-up
+  file is written back byte for byte; otherwise only the journaled keys
+  that still hold setup's value are reverted, and that is reported;
+- copy_new_to: the named shared skills are copied into the chosen profiles
+  (before the put-back below, so the user's choice wins);
+- retired copies are moved back after their tree_sha256 is checked against
+  the journal; a missing retired copy is taken from the backup's skills/
+  snapshot (when its hash matches), a changed one is reported and left;
+  if something is at the original place now, the copy stays in the backup;
+- cron jobs.json: written back the sha-or-report way, under Hermes' cron lock.
 
-The shared root is never modified. Only recorded steps are undone, so the
-journal of a partial apply restores exactly what that apply did. Stdlib +
-PyYAML only.
+The shared root is never modified: copies into it, commits and markdown
+rewrites there are kept (markdown rewrites and partial copies are listed).
+Every run is appended to backups/<id>/restore.json. Stdlib + PyYAML only.
 """
 
 from __future__ import annotations
 
+import contextlib
+import copy as _copy
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from commons.core.apply import load_journal
-from commons.core.backup import copy_tree, create_backup, file_sha256
-from commons.core.configio import ConfigWriter
+from commons.core.apply import JOURNAL_VERSION, PENDING, intents
+from commons.core.backup import (
+    MANIFEST,
+    SKILLS,
+    copy_tree,
+    create_backup,
+    file_sha256,
+    tree_sha256,
+    verify_backup,
+    write_json_atomic,
+)
+from commons.core.configio import ConfigWriter, lookup_key, set_key
 from commons.core.fleet import CONFIG_FILE, Profile, load_config
 from commons.core.gitrepo import GitRepo
 from commons.core.layout import Layout
 from commons.core.moves import move_noreplace
 from commons.core.paths import cron_lock, write_atomic
-from commons.core.proposal import CREATE_DIR_KEY, PLUGIN, PLUGINS_KEY, SHARED
+from commons.core.proposal import CREATE_DIR_KEY, SHARED
 from commons.core.resolve import config_path
 from commons.core.scan import SkillCopy, scan_root
 
 REPORT_KEYS_ONLY = "config changed after setup; reverted commons keys only"
+RESTORE_LOG = "restore.json"
+CONFIG_OPS = ("config_set", "config_list_add")
+
+
+class RestoreError(RuntimeError):
+    """A backup that cannot be restored at all (missing, unreadable, unknown journal)."""
 
 
 @dataclass
@@ -56,10 +77,18 @@ class ConfigPlan:
     home: Path
     backup_path: Path
     before_sha256: str | None
-    after_sha256: str | None
-    create_dir_set: bool
-    create_dir_old: Any
-    plugin_added: bool
+    intents: list[dict[str, Any]] = field(default_factory=list)  # config_set / config_list_add args+state
+
+    @property
+    def after_sha256s(self) -> set[str]:
+        return {
+            i["args"]["config_sha256_after"] for i in self.intents if i["args"].get("config_sha256_after")
+        }
+
+    def create_dir_intent(self) -> dict[str, Any] | None:
+        return next(
+            (i for i in self.intents if i["op"] == "config_set" and i["args"]["key"] == CREATE_DIR_KEY), None
+        )
 
 
 @dataclass
@@ -69,6 +98,10 @@ class RetiredPlan:
     rel: str
     path: Path
     retired_path: Path
+    fingerprint: str | None
+    snapshot_path: Path
+    state: str  # 'done' or 'pending' in the journal
+    found: str  # what plan_restore saw: 'retired', 'both', 'neither'
 
 
 @dataclass
@@ -97,8 +130,12 @@ class RestorePlan:
     configs: list[ConfigPlan] = field(default_factory=list)
     retired: list[RetiredPlan] = field(default_factory=list)
     cron: list[CronPlan] = field(default_factory=list)
+    md_rewrites: list[str] = field(default_factory=list)  # shared-root markdown setup rewrote (kept)
+    partial_copies: list[str] = field(default_factory=list)  # pending copies into the shared root (kept)
+    undecided: list[str] = field(default_factory=list)
     shared_changes: list[SharedChange] = field(default_factory=list)
     shadowed_after: list[tuple[str, str]] = field(default_factory=list)  # (profile, name)
+    homes: dict[str, Path] = field(default_factory=dict)  # profile -> home, from the journal
 
     @property
     def layout(self) -> Layout:
@@ -115,6 +152,10 @@ class RestoreResult:
 
 def _no_hash(_path: Path) -> str:
     return ""
+
+
+def _exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
 
 
 def _shared_copies(shared_root: Path) -> list[SkillCopy]:
@@ -137,11 +178,40 @@ def _shared_changes(shared_root: Path, since: str | None) -> list[SharedChange]:
     return out
 
 
+def load_restore_journal(layout: Layout, backup_id: str) -> dict[str, Any]:
+    """The journal of *backup_id*, or RestoreError when there is none to restore from."""
+    try:
+        path = layout.journal_path(backup_id)
+    except ValueError as exc:
+        raise RestoreError(str(exc)) from None
+    if not layout.backup_dir(backup_id).is_dir():
+        raise RestoreError(f"no backup {backup_id!r} in {layout.backups_dir}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise RestoreError(
+            f"backup {backup_id!r} has no setup journal ({path}); nothing to restore"
+        ) from None
+    except (OSError, ValueError) as exc:
+        raise RestoreError(f"cannot read the journal of backup {backup_id!r}: {exc}") from None
+    if not isinstance(data, dict) or data.get("version") != JOURNAL_VERSION:
+        raise RestoreError(f"backup {backup_id!r}: journal version {data.get('version')!r} is not supported")
+    return data
+
+
+def _retire_found(path: Path, retired: Path) -> str:
+    src, dst = _exists(path), _exists(retired)
+    if dst and not src:
+        return "retired"
+    if src and not dst:
+        return "in-place"
+    return "both" if src else "neither"
+
+
 def plan_restore(layout: Layout, backup_id: str) -> RestorePlan:
     """Read the journal of *backup_id* and list what restore would do (see module docstring)."""
-    j = load_journal(layout, backup_id)
+    j = load_restore_journal(layout, backup_id)
     backup_dir = layout.backup_dir(backup_id)
-    steps = set(j["steps"])
     since = j["git"].get("final_sha") or j["git"].get("base_sha")
     plan = RestorePlan(
         backup_id=backup_id,
@@ -149,62 +219,119 @@ def plan_restore(layout: Layout, backup_id: str) -> RestorePlan:
         state_dir=Path(j["state_dir"]),
         complete=bool(j.get("complete")),
         since_sha=since,
+        homes={name: Path(rec["home"]) for name, rec in j["profiles"].items()},
     )
-    for name, rec in j["profiles"].items():
-        if f"config {name}" not in steps:
-            continue
-        plan.configs.append(
-            ConfigPlan(
-                profile=name,
-                home=Path(rec["home"]),
-                backup_path=backup_dir / name / CONFIG_FILE,
-                before_sha256=rec["config_before_sha256"],
-                after_sha256=rec["config_after_sha256"],
-                create_dir_set=bool(rec["create_dir_set"]),
-                create_dir_old=rec["create_dir_old"],
-                plugin_added=bool(rec["plugin_added"]),
+    configs: dict[str, ConfigPlan] = {}
+    for i in intents(j):
+        op, args = i["op"], i["args"]
+        if op in CONFIG_OPS:
+            name = args["profile"]
+            if name not in configs:
+                rec = j["profiles"][name]
+                configs[name] = ConfigPlan(
+                    name, Path(rec["home"]), backup_dir / name / CONFIG_FILE, rec["config_before_sha256"]
+                )
+            configs[name].intents.append(i)
+        elif op == "retire":
+            src, dst = Path(args["src"]), Path(args["dst"])
+            found = _retire_found(src, dst)
+            if found == "in-place":
+                continue  # it never happened: nothing to undo
+            plan.retired.append(
+                RetiredPlan(
+                    args["name"],
+                    args["profile"],
+                    args["rel"],
+                    src,
+                    dst,
+                    args.get("fingerprint"),
+                    backup_dir / args["profile"] / SKILLS / args["rel"],
+                    i["state"],
+                    found,
+                )
             )
-        )
-    plan.retired = [
-        RetiredPlan(r["name"], r["profile"], r["rel"], Path(r["path"]), Path(r["retired_path"]))
-        for r in j["retired"]
-    ]
-    plan.cron = [
-        CronPlan(
-            c["profile"], Path(c["jobs_path"]), Path(c["backup_path"]), c["before_sha256"], c["after_sha256"]
-        )
-        for c in j["cron"]
-    ]
+        elif op == "cron_write":
+            plan.cron.append(
+                CronPlan(
+                    args["profile"],
+                    Path(args["path"]),
+                    Path(args["backup_copy"]),
+                    args["sha_before"],
+                    args["sha_after"],
+                )
+            )
+        elif op == "md_write":
+            current = file_sha256(Path(args["path"]))
+            if current == args["sha_after"]:
+                plan.md_rewrites.append(
+                    f"{args['path']} was rewritten by setup; kept (original at {args['backup_copy']})"
+                )
+            elif current != args["sha_before"]:
+                plan.undecided.append(f"shared root: {args['path']} changed since setup rewrote it; kept")
+        elif op == "copy" and i["state"] == PENDING and _exists(Path(args["target"])):
+            plan.partial_copies.append(args["target"])
+    plan.configs = list(configs.values())
     plan.shared_changes = _shared_changes(plan.shared_root, since)
-    plan.shadowed_after = _shadowed_after(plan, j)
+    plan.shadowed_after = _shadowed_after(plan)
     return plan
 
 
 def _create_dir_after(plan: RestorePlan, profile: str, home: Path) -> Path | None:
     """Where this profile's skills.create_dir points once restore has run."""
     cfg = next((c for c in plan.configs if c.profile == profile), None)
-    if cfg is not None and cfg.create_dir_set:
-        value = cfg.create_dir_old
+    intent = cfg.create_dir_intent() if cfg is not None else None
+    if intent is not None:
+        value = intent["args"]["old_value"]
     else:
-        skills = load_config(home / CONFIG_FILE).get("skills")
-        value = skills.get("create_dir") if isinstance(skills, dict) else None
+        value = lookup_key(load_config(home / CONFIG_FILE), CREATE_DIR_KEY)
     if not isinstance(value, str) or not value.strip():
         return None
     return config_path(home, Path(value))
 
 
-def _shadowed_after(plan: RestorePlan, journal: Mapping[str, Any]) -> list[tuple[str, str]]:
+def _shadowed_after(plan: RestorePlan) -> list[tuple[str, str]]:
     shared = config_path(Path("/"), plan.shared_root)
     names = {c.name for c in _shared_copies(plan.shared_root)}
     out: list[tuple[str, str]] = []
     for r in plan.retired:
-        home = Path(journal["profiles"][r.profile]["home"])
-        if r.name in names and _create_dir_after(plan, r.profile, home) == shared:
+        if r.name in names and _create_dir_after(plan, r.profile, plan.homes[r.profile]) == shared:
             out.append((r.profile, r.name))
     return sorted(set(out))
 
 
-# ------------------------------------------------------------------ restore
+# ------------------------------------------------------------------ config
+
+
+def _model_states(base: dict, cfg: ConfigPlan) -> list[dict]:
+    """The parsed config after 0, 1, ... n of the journaled config changes, applied as data."""
+    states = [_copy.deepcopy(base)]
+    data = _copy.deepcopy(base)
+    for i in cfg.intents:
+        args = i["args"]
+        if i["op"] == "config_set":
+            set_key(data, args["key"], args["new_value"])
+        elif not args.get("was_present"):
+            current = lookup_key(data, args["key"])
+            items = list(current) if isinstance(current, list) else []
+            if args["item"] not in items:
+                set_key(data, args["key"], [*items, args["item"]])
+        states.append(_copy.deepcopy(data))
+    return states
+
+
+def _as_setup_left_it(cfg: ConfigPlan, path: Path) -> bool:
+    """True when config.yaml differs from its pre-setup state only by setup's own changes."""
+    current = file_sha256(path)
+    if current is not None and current in cfg.after_sha256s:
+        return True
+    base = load_config(cfg.backup_path) if cfg.before_sha256 is not None else {}
+    return current is not None and load_config(path) in _model_states(base, cfg)
+
+
+def _set_happened(args: Mapping[str, Any], value: Any, home: Path, shared: Path) -> bool:
+    if args["key"] == CREATE_DIR_KEY:
+        return isinstance(value, str) and bool(value.strip()) and config_path(home, Path(value)) == shared
+    return value == args["new_value"]
 
 
 def _restore_config(
@@ -213,55 +340,100 @@ def _restore_config(
     path = profile.home / CONFIG_FILE
     current = file_sha256(path)
     if current == cfg.before_sha256:
-        result.reports.append(f"{cfg.profile}: config.yaml already as before setup")
+        if not any(i["state"] == PENDING for i in cfg.intents):
+            result.reports.append(f"{cfg.profile}: config.yaml already as before setup")
         return
-    if current is not None and current == cfg.after_sha256:
+    if _as_setup_left_it(cfg, path):
         if cfg.before_sha256 is None:
             # There was no config before setup: move the one setup made aside, never delete it.
             dest = result.pre_restore_dir / "displaced" / cfg.profile / CONFIG_FILE
             move_noreplace(path, dest)
             result.done.append(f"{cfg.profile}: config.yaml moved aside to {dest} (none before setup)")
             return
-        data = cfg.backup_path.read_bytes()
         if file_sha256(cfg.backup_path) != cfg.before_sha256:
             result.reports.append(f"{cfg.profile}: backed-up config.yaml does not match its hash; left alone")
             return
-        write_atomic(path, data)
+        write_atomic(path, cfg.backup_path.read_bytes())
         result.done.append(f"{cfg.profile}: config.yaml restored")
         return
     reverted = []
-    if cfg.create_dir_set:
-        value = writer.get(profile, CREATE_DIR_KEY)
-        if isinstance(value, str) and value.strip() and config_path(profile.home, Path(value)) == shared:
-            if cfg.create_dir_old is None:
-                writer.unset(profile, CREATE_DIR_KEY)
+    for i in reversed(cfg.intents):
+        args = i["args"]
+        value = writer.get(profile, args["key"])
+        if i["op"] == "config_set":
+            if not _set_happened(args, value, profile.home, shared):
+                if i["state"] != PENDING:
+                    result.reports.append(
+                        f"{cfg.profile}: {args['key']} no longer holds setup's value; left alone"
+                    )
+                continue
+            if args["old_value_present"]:
+                writer.set(profile, args["key"], args["old_value"])
             else:
-                writer.set(profile, CREATE_DIR_KEY, cfg.create_dir_old)
-            reverted.append(CREATE_DIR_KEY)
-        else:
-            result.reports.append(
-                f"{cfg.profile}: {CREATE_DIR_KEY} no longer points at the shared root; left alone"
-            )
-    if cfg.plugin_added:
-        enabled = writer.get(profile, PLUGINS_KEY)
-        if isinstance(enabled, list) and PLUGIN in enabled:
-            writer.remove_from_list(profile, PLUGINS_KEY, PLUGIN)
-            reverted.append(PLUGINS_KEY)
+                writer.unset(profile, args["key"])
+            reverted.append(args["key"])
+        elif not args.get("was_present") and isinstance(value, list) and args["item"] in value:
+            writer.remove_from_list(profile, args["key"], args["item"])
+            reverted.append(args["key"])
     keys = ", ".join(reverted) if reverted else "none"
     result.reports.append(f"{cfg.profile}: {REPORT_KEYS_ONLY} ({keys})")
 
 
-def _restore_cron(c: CronPlan, result: RestoreResult) -> None:
-    if not c.backup_path.is_file():
-        result.reports.append(f"{c.profile}: no backup of {c.jobs_path}; left alone")
+# ------------------------------------------------------------------ retire
+
+
+def _restore_retired(r: RetiredPlan, result: RestoreResult) -> None:
+    src_here, dst_here = _exists(r.path), _exists(r.retired_path)
+    if src_here:
+        if dst_here:
+            result.reports.append(
+                f"{r.profile}: {r.path} exists now; the retired copy stays at {r.retired_path}"
+            )
+        elif r.state == PENDING:
+            pass  # the retire never happened after all
+        else:
+            result.reports.append(
+                f"{r.profile}: {r.path} exists now and its retired copy is missing; left alone"
+            )
         return
+    if dst_here:
+        actual = tree_sha256(r.retired_path)
+        if actual != r.fingerprint:
+            result.reports.append(
+                f"{r.profile}: retired copy {r.retired_path} does not match the journal; "
+                f"{r.rel} not restored (backup snapshot: {r.snapshot_path})"
+            )
+            return
+        move_noreplace(r.retired_path, r.path)
+        result.done.append(f"{r.profile}: {r.rel} put back")
+        return
+    # Neither place has it: the retired copy is missing.
+    if _exists(r.snapshot_path) and tree_sha256(r.snapshot_path) == r.fingerprint:
+        r.path.parent.mkdir(parents=True, exist_ok=True)
+        copy_tree(r.snapshot_path, r.path)
+        result.done.append(f"{r.profile}: {r.rel} put back from the backup snapshot")
+        result.reports.append(
+            f"{r.profile}: retired copy {r.retired_path} is missing; restored {r.rel} from {r.snapshot_path}"
+        )
+        return
+    result.reports.append(f"{r.profile}: retired copy {r.retired_path} is missing; {r.rel} not restored")
+
+
+# ------------------------------------------------------------------ cron
+
+
+def _restore_cron(c: CronPlan, result: RestoreResult) -> None:
     with cron_lock(c.jobs_path):
         current = file_sha256(c.jobs_path)
         if current == c.before_sha256:
-            result.reports.append(f"{c.profile}: {c.jobs_path} already as before setup")
             return
         if current != c.after_sha256:
             result.reports.append(f"{c.profile}: {c.jobs_path} changed after setup; left alone")
+            return
+        if file_sha256(c.backup_path) != c.before_sha256:
+            result.reports.append(
+                f"{c.profile}: backup of {c.jobs_path} does not match the journal; left alone"
+            )
             return
         write_atomic(c.jobs_path, c.backup_path.read_bytes())
     result.done.append(f"{c.profile}: {c.jobs_path} restored")
@@ -278,12 +450,39 @@ def _copy_new(
         for profile in copy_new_to[name]:
             c = shared[name]
             dest = by_name[profile].skills_dir / c.rel
-            if dest.exists() or dest.is_symlink():
+            if _exists(dest):
                 result.reports.append(f"{profile}: {dest} already exists; {name} not copied")
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             copy_tree(c.path, dest)
             result.done.append(f"{profile}: copied shared {name} to {dest}")
+
+
+@contextlib.contextmanager
+def _shared_lock(shared_root: Path) -> Iterator[None]:
+    """The shared root's git lock, when there is a shared root to lock (never created here)."""
+    if Path(shared_root).is_dir():
+        with GitRepo(shared_root).locked():
+            yield
+    else:
+        yield
+
+
+def _append_run(path: Path, run: dict[str, Any]) -> None:
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        existing = {}
+    runs = existing.get("runs") if isinstance(existing, dict) else None
+    if not isinstance(runs, list):
+        runs = [existing] if isinstance(existing, dict) and existing else []
+    write_json_atomic(path, {"runs": [*runs, run]})
+
+
+def _backup_problems(layout: Layout, backup_id: str) -> list[str]:
+    if not (layout.backup_dir(backup_id) / MANIFEST).is_file():
+        return [f"backup {backup_id}: no manifest; config and snapshot checks rely on the journal only"]
+    return [f"backup {backup_id}: {p}" for p in verify_backup(layout, backup_id)]
 
 
 def restore(
@@ -308,10 +507,27 @@ def restore(
         if unknown:
             raise ValueError(f"copy_new_to: unknown profiles {unknown} for {name!r}")
     layout = plan.layout
-    bid = create_backup(layout, profiles, "pre-restore", now=now)
-    result = RestoreResult(pre_restore_backup_id=bid, pre_restore_dir=layout.backup_dir(bid))
-    shared = config_path(Path("/"), plan.shared_root)
+    with _shared_lock(plan.shared_root):
+        problems = _backup_problems(layout, plan.backup_id)
+        bid = create_backup(layout, profiles, "pre-restore", now=now)
+        result = RestoreResult(pre_restore_backup_id=bid, pre_restore_dir=layout.backup_dir(bid))
+        result.reports += problems
+        _restore_all(plan, by_name, writer, copy_new_to, result)
+        _append_run(
+            layout.backup_dir(plan.backup_id) / RESTORE_LOG,
+            {"pre_restore_backup_id": bid, "done": result.done, "reports": result.reports},
+        )
+    return result
 
+
+def _restore_all(
+    plan: RestorePlan,
+    by_name: Mapping[str, Profile],
+    writer: ConfigWriter,
+    copy_new_to: Mapping[str, Sequence[str]],
+    result: RestoreResult,
+) -> None:
+    shared = config_path(Path("/"), plan.shared_root)
     for cfg in plan.configs:
         profile = by_name.get(cfg.profile)
         if profile is None:
@@ -322,30 +538,17 @@ def restore(
     _copy_new(plan, by_name, copy_new_to, result)
 
     for r in reversed(plan.retired):
-        if r.path.exists() or r.path.is_symlink():
-            result.reports.append(
-                f"{r.profile}: {r.path} exists now; the retired copy stays at {r.retired_path}"
-            )
-            continue
-        if not (r.retired_path.exists() or r.retired_path.is_symlink()):
-            result.reports.append(
-                f"{r.profile}: retired copy {r.retired_path} is missing; {r.rel} not restored"
-            )
-            continue
-        move_noreplace(r.retired_path, r.path)
-        result.done.append(f"{r.profile}: {r.rel} put back")
+        _restore_retired(r, result)
 
-    for c in plan.cron:
+    for c in reversed(plan.cron):
         _restore_cron(c, result)
 
+    result.reports += plan.undecided
+    for target in plan.partial_copies:
+        result.reports.append(f"shared root: {target} may be a partial copy from the interrupted setup; kept")
+    for md in plan.md_rewrites:
+        result.reports.append(f"shared root: {md}")
     for profile, name in plan.shadowed_after:
         result.reports.append(f"{profile}: the restored {name} shadows the shared root's copy again")
     for ch in plan.shared_changes:
         result.reports.append(f"shared root: {ch.name} ({ch.rel}) is {ch.status} since setup and was kept")
-    journal_note = layout.backup_dir(plan.backup_id) / "restore.json"
-    journal_note.write_text(
-        json.dumps({"pre_restore_backup_id": bid, "done": result.done, "reports": result.reports}, indent=2)
-        + "\n",
-        encoding="utf-8",
-    )
-    return result

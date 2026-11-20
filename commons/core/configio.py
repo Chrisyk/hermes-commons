@@ -92,6 +92,31 @@ def _remove(data: dict, parts: list[str]) -> bool:
     return True
 
 
+def lookup_key(data: dict, key: str) -> Any:
+    """The value at dotted *key* in a parsed config, or None."""
+    return _lookup(data, _parts(key))
+
+
+def has_key(data: dict, key: str) -> bool:
+    """True when dotted *key* is present in a parsed config (even with a null value)."""
+    node: Any = data
+    for part in _parts(key):
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def set_key(data: dict, key: str, value: Any) -> None:
+    """Set dotted *key* in a parsed config the way YamlFileWriter.set does."""
+    _assign(data, key, value)
+
+
+def unset_key(data: dict, key: str) -> bool:
+    """Remove dotted *key* the way YamlFileWriter.unset does; True if it existed."""
+    return _remove(data, _parts(key))
+
+
 def yaml_dump_flow(value: Any) -> str:
     """One-line YAML for a value (flow style), as `hermes config set` expects."""
     text = yaml.safe_dump(

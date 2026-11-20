@@ -22,8 +22,10 @@ same lock. Stdlib only.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -35,7 +37,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from commons.core.fleet import Profile
 
@@ -72,6 +74,24 @@ class Finding:
     job_id: str | None = None  # cron only
     field: str | None = None  # cron only
     path: Path | None = None  # skill-file only: the markdown file
+
+
+@dataclass(frozen=True)
+class PlannedWrite:
+    """One file rewrite(), told to a WriteHook before and after it lands."""
+
+    kind: Kind
+    path: Path
+    backup: Path  # the original, kept before the write
+    sha_before: str | None
+    sha_after: str
+    profile: str | None = None  # cron only
+
+
+class WriteHook(Protocol):
+    def before(self, write: PlannedWrite) -> None: ...
+
+    def after(self, write: PlannedWrite) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -305,8 +325,36 @@ def _replace_all(text: str, findings: list[Finding]) -> tuple[str, list[Finding]
     return text, done, missing
 
 
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_bytes(path: Path) -> bytes | None:
+    try:
+        return Path(path).read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+# The WriteHook of the rewrite() call in progress (a context variable, so the
+# per-file helpers keep their signatures).
+_HOOK: contextvars.ContextVar[WriteHook | None] = contextvars.ContextVar("commons_write_hook", default=None)
+
+
+def _write(write: PlannedWrite, data: bytes) -> None:
+    """Back the file up, tell the hook, write it, tell the hook again."""
+    hook = _HOOK.get()
+    _backup_once(write.path, write.backup)
+    if hook is not None:
+        hook.before(write)
+    write_atomic(write.path, data)
+    if hook is not None:
+        hook.after(write)
+
+
 def _rewrite_cron(path: Path, findings: list[Finding], backup: Path) -> tuple[list[Finding], list[Finding]]:
     with cron_lock(path):
+        raw = _read_bytes(path)
         data, jobs = load_jobs_file(path)
         by_job: dict[tuple[str, str], list[Finding]] = {}
         for f in findings:
@@ -324,33 +372,40 @@ def _rewrite_cron(path: Path, findings: list[Finding], backup: Path) -> tuple[li
                     missing += todo
         for left in by_job.values():
             missing += left
-        if done:
-            _backup_once(path, backup)
-            write_atomic(path, json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8"))
+        if done and raw is not None:
+            new = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            profile = done[0].profile
+            _write(PlannedWrite("cron", Path(path), backup, _sha(raw), _sha(new), profile), new)
     return done, missing
 
 
 def _rewrite_file(path: Path, findings: list[Finding], backup: Path) -> tuple[list[Finding], list[Finding]]:
-    text = _read_text(path)
-    if text is None:
+    raw = _read_bytes(path)
+    text = _read_text(path) if raw is not None else None
+    if text is None or raw is None:
         return [], findings
     new_text, done, missing = _replace_all(text, findings)
     if done:
-        _backup_once(path, backup)
-        write_atomic(path, new_text.encode("utf-8"))
+        new = new_text.encode("utf-8")
+        _write(PlannedWrite("skill-file", Path(path), backup, _sha(raw), _sha(new)), new)
     return done, missing
 
 
 def rewrite(
-    findings: Iterable[Finding], backup_dir: Path, cron_paths: Mapping[str, Path]
+    findings: Iterable[Finding],
+    backup_dir: Path,
+    cron_paths: Mapping[str, Path],
+    hook: WriteHook | None = None,
 ) -> tuple[list[Finding], list[Finding]]:
     """Apply every finding whose new path exists; return (rewritten, skipped).
 
     Each touched file is first copied to rewrite_backup_path (kept from the
     first pass if one exists), then rewritten atomically with fsync. Cron
-    findings go to cron_paths[profile] under Hermes' cron lock. Skipped:
-    findings whose target is missing, whose profile has no cron path, or
-    whose text is no longer in the file.
+    findings go to cron_paths[profile] under Hermes' cron lock. *hook*, if
+    given, hears of every write just before and just after it (still under
+    the cron lock), so a caller can journal it ahead. Skipped: findings
+    whose target is missing, whose profile has no cron path, or whose text
+    is no longer in the file.
     """
     findings = list(findings)
     skipped = [f for f in findings if not f.new_exists]
@@ -368,6 +423,20 @@ def rewrite(
             key = ("skill-file", Path(f.path))
         files.setdefault(key, []).append(f)
     rewritten: list[Finding] = []
+    token = _HOOK.set(hook)
+    try:
+        _rewrite_groups(files, backup_dir, rewritten, skipped)
+    finally:
+        _HOOK.reset(token)
+    return rewritten, skipped
+
+
+def _rewrite_groups(
+    files: Mapping[tuple[str, Path], list[Finding]],
+    backup_dir: Path,
+    rewritten: list[Finding],
+    skipped: list[Finding],
+) -> None:
     for (kind, path), group in files.items():
         backup = rewrite_backup_path(backup_dir, group[0])
         try:
@@ -381,4 +450,3 @@ def rewrite(
             done, missing = [], group
         rewritten += done
         skipped += missing
-    return rewritten, skipped
