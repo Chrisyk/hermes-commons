@@ -454,6 +454,22 @@ def _check_target(task: MergeTask, target: Path) -> MergeVariant | None:
     return shared
 
 
+def _check_accept(task: MergeTask, check: MergeCheck, force: bool) -> MergeVariant | None:
+    """Every read-check accept makes; run with the repo lock held. Returns the shared variant to retire."""
+    if check.problems:
+        raise MergeError(f"{task.name}: not accepted:\n" + "\n".join(f"  {p}" for p in check.problems))
+    if (check.lost_lines or check.lost_files) and not force:
+        raise MergeError(
+            f"{task.name}: the staged merge loses content (accept with force to keep it anyway):\n"
+            + describe_losses(check)
+        )
+    if check.staged_hash is None or tree_sha256(Path(task.staging)) != check.staged_hash:
+        raise MergeError(f"{task.name}: staging changed since it was validated; validate again")
+    if task.name in _names(read_commons_config(task.layout), RESOLVED):
+        raise MergeError(f"{task.name}: already resolved")
+    return _check_target(task, Path(task.shared_root) / task.target_rel)
+
+
 def accept(
     task: MergeTask, check: MergeCheck, force: bool = False, now: datetime | None = None
 ) -> AcceptResult:
@@ -463,42 +479,32 @@ def accept(
     lines or files unless *force*, when staging changed after validation,
     or when the target is not safe to write.
     """
-    if check.problems:
-        raise MergeError(f"{task.name}: not accepted:\n" + "\n".join(f"  {p}" for p in check.problems))
-    if (check.lost_lines or check.lost_files) and not force:
-        raise MergeError(
-            f"{task.name}: the staged merge loses content (accept with force to keep it anyway):\n"
-            + describe_losses(check)
-        )
-    staging = Path(task.staging)
-    if check.staged_hash is None or tree_sha256(staging) != check.staged_hash:
-        raise MergeError(f"{task.name}: staging changed since it was validated; validate again")
-    layout = task.layout
-    if task.name in _names(read_commons_config(layout), RESOLVED):
-        raise MergeError(f"{task.name}: already resolved")
+    repo = GitRepo(task.shared_root)
     target = Path(task.shared_root) / task.target_rel
-    shared = _check_target(task, target)
     profiles = profiles_from_homes(task.profile_homes)
-    with operation(layout, profiles, f"merge-{task.name}", "merge", now) as op:
-        if shared is not None:
-            op.retire_shared(task.name, task.target_rel)
-        op.place(task.name, staging, target)
-        sha = op.commit([target], f"merge {task.name}", kind="merge")
-        kept = []
-        for v in task.variants:
-            if v.retire and v.profile in op.profiles:
-                why = op.retire_profile_copy(task.name, v.profile, v.rel, v.fingerprint)
-                if why is not None:
-                    kept.append(why)
-        config = read_commons_config(layout)
-        _set_names(config, RESOLVED, add=[task.name])
-        _set_names(config, SKIPPED, drop=[task.name])
-        op.write_config(config, f"commons: mark {task.name} resolved")
-        task_file = _task_path(layout, task.name)
-        if task_file.exists():
-            op.move_task_file(task_file, op.backup_dir / "merge-task.json")
-        op.journal.data["problems"] = kept
-        return AcceptResult(op.backup_id, sha, kept, list(op.done))
+    with repo.locked():  # every check and the operation under one hold of the lock
+        shared = _check_accept(task, check, force)
+        with operation(task.layout, profiles, f"merge-{task.name}", "merge", now) as op:
+            if shared is not None:
+                op.retire_shared(task.name, task.target_rel, expected=shared.fingerprint)
+            op.place(task.name, Path(task.staging), target)
+            sha = op.commit([target], f"merge {task.name}", kind="merge")
+            kept = []
+            for v in task.variants:
+                if v.retire and v.profile in op.profiles:
+                    why = op.retire_profile_copy(task.name, v.profile, v.rel, v.fingerprint)
+                    if why is not None:
+                        kept.append(why)
+            layout = task.layout
+            config = read_commons_config(layout)
+            _set_names(config, RESOLVED, add=[task.name])
+            _set_names(config, SKIPPED, drop=[task.name])
+            op.write_config(config, f"commons: mark {task.name} resolved")
+            task_file = _task_path(layout, task.name)
+            if task_file.exists():
+                op.move_task_file(task_file, op.backup_dir / "merge-task.json")
+            op.journal.data["problems"] = kept
+            return AcceptResult(op.backup_id, sha, kept, list(op.done))
 
 
 def skip(layout: Layout, name: str) -> None:

@@ -79,7 +79,15 @@ def _inside(path: str, folder: str) -> bool:
 
 
 def _dirty(repo: GitRepo, rel: str) -> list[str]:
-    return [line for line in repo.status_porcelain() if _inside(line[3:].strip('"'), rel)]
+    """Paths under *rel* with uncommitted changes (git status --porcelain -z, so never quoted)."""
+    return repo.status_paths(rel)
+
+
+def _check_clean(repo: GitRepo, name: str, rel: str) -> None:
+    if _dirty(repo, rel):
+        raise HistoryError(
+            f"{name} has uncommitted changes in {rel}; commit them first (commons check --fix-safe)"
+        )
 
 
 def _added_since(root: Path, folder: Path, before: set[str]) -> list[str]:
@@ -109,38 +117,50 @@ def _added_since(root: Path, folder: Path, before: set[str]) -> list[str]:
 
 
 def undo(layout: Layout, name: str, to: str | None = None, now: datetime | None = None) -> UndoResult:
-    """Undo the latest change to *name*, or put it back as it was at *to* (see module docstring)."""
-    folder = skill_folder(layout, name)
+    """Undo the latest change to *name*, or put it back as it was at *to* (see module docstring).
+
+    Every check (the folder, uncommitted changes, the commit) runs with the
+    repo lock held, the same hold the change itself runs under.
+    """
     repo = GitRepo(layout.shared_root)
+    with repo.locked():  # the checks and the change under one hold of the lock
+        folder = skill_folder(layout, name)
+        _check_clean(repo, name, folder.rel)
+        if to is None:
+            return _undo_latest(layout, repo, name, folder, now)
+        return _undo_to(layout, repo, name, folder, to, now)
+
+
+def _undo_latest(layout: Layout, repo: GitRepo, name: str, folder: SkillCopy, now: datetime | None) -> UndoResult:
     rel = folder.rel
-    if _dirty(repo, rel):
+    entries = repo.log(folder.path, n=1)
+    if not entries:
+        raise HistoryError(f"{name} has no commits to undo")
+    sha = entries[0][0]
+    touched = repo.files_in_commit(sha)
+    others = [p for p in touched if not _inside(p, rel)]
+    if others:
+        listed = ", ".join(others[:5]) + (" ..." if len(others) > 5 else "")
         raise HistoryError(
-            f"{name} has uncommitted changes in {rel}; commit them first (commons check --fix-safe)"
+            f"the latest commit touching {name} ({sha[:7]}) also changed {listed}; "
+            f"pass --to <sha> to put {name} back as it was at that commit"
         )
-    if to is None:
-        entries = repo.log(folder.path, n=1)
-        if not entries:
-            raise HistoryError(f"{name} has no commits to undo")
-        sha = entries[0][0]
-        touched = repo.files_in_commit(sha)
-        others = [p for p in touched if not _inside(p, rel)]
-        if others:
-            listed = ", ".join(others[:5]) + (" ..." if len(others) > 5 else "")
-            raise HistoryError(
-                f"the latest commit touching {name} ({sha[:7]}) also changed {listed}; "
-                f"pass --to <sha> to put {name} back as it was at that commit"
-            )
-        with operation(layout, [], f"undo-{name}", "undo", now) as op:
+    with operation(layout, [], f"undo-{name}", "undo", now) as op:
 
-            def action():
-                return {"new_sha": repo.revert(sha)}
+        def action():
+            return {"new_sha": repo.revert(sha)}
 
-            entry = op._act("revert", {"sha": sha, "path": rel, "head_before": repo.head()}, action)
-            new = entry["args"]["new_sha"]
-            op.journal.data["git"]["final_sha"] = new
-            op.journal.save()
-        return UndoResult(op.backup_id, new, reverted=sha)
+        entry = op._act("revert", {"sha": sha, "path": rel, "head_before": repo.head()}, action)
+        new = entry["args"]["new_sha"]
+        op.journal.data["git"]["final_sha"] = new
+        op.journal.save()
+    return UndoResult(op.backup_id, new, reverted=sha)
 
+
+def _undo_to(
+    layout: Layout, repo: GitRepo, name: str, folder: SkillCopy, to: str, now: datetime | None
+) -> UndoResult:
+    rel = folder.rel
     try:
         full = repo.resolve_commit(to)
     except GitError:

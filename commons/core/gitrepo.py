@@ -5,6 +5,8 @@ Every public operation that writes holds an exclusive fcntl.flock on
 setup, the gateway's profiles) never interleave git commands. Read-only calls
 (is_repo, status_porcelain, log) take no lock, create nothing and pass
 --no-optional-locks so git does not refresh the index behind a writer.
+Every path handed to git is a ':(literal)' pathspec (literal()), so a folder
+name holding '*', '[', spaces or non-ASCII matches only itself.
 
 Every git call disables hooks and commit signing, never prompts, runs with a
 timeout (the whole process group is killed on expiry), ignores GIT_DIR-style
@@ -345,6 +347,33 @@ class GitRepo:
         out = self._run("status", "--porcelain=v1", "--", ".", *_EXCLUDE_PATHSPECS, read_only=True).stdout
         return [line for line in out.split("\n") if line]
 
+    def status_paths(self, path: Path | str) -> list[str]:
+        """Repo-relative paths under *path* with uncommitted changes (git status --porcelain -z). Read-only.
+
+        Uses -z, so names are never quoted; a rename lists both names.
+        """
+        spec = literal(self._relative(Path(path)))
+        out = self._run(
+            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", spec, *_EXCLUDE_PATHSPECS, read_only=True
+        ).stdout
+        fields = out.split("\0")
+        paths: list[str] = []
+        i = 0
+        while i < len(fields):
+            entry = fields[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            paths.append(entry[3:])
+            if entry[0] in "RC":  # the original name follows as its own field
+                paths.append(fields[i])
+                i += 1
+        return paths
+
+    def holds_lock(self) -> bool:
+        """True when this thread holds the repo lock right now."""
+        return self._holds_lock()
+
     def commit_paths(self, paths: list[Path], message: str) -> str | None:
         """Stage and commit only these paths (additions, edits, deletions).
 
@@ -356,10 +385,11 @@ class GitRepo:
         rels = [self._relative(p) for p in paths]
         with self.locked():
             self._ensure_excluded()
-            self._run("add", "-A", "--", *rels)
-            if self._run("diff", "--cached", "--quiet", "--", *rels, check=False).returncode == 0:
+            specs = [literal(r) for r in rels]
+            self._run("add", "-A", "--", *specs)
+            if self._run("diff", "--cached", "--quiet", "--", *specs, check=False).returncode == 0:
                 return None
-            self._run("commit", "-q", "-m", message, "--", *rels, identity=True)
+            self._run("commit", "-q", "-m", message, "--", *specs, identity=True)
             return self._head()
 
     def commit_all(self, message: str, exclude: Iterable[Path] = ()) -> str | None:
@@ -376,7 +406,7 @@ class GitRepo:
             if rels and self._has_head():
                 self._run("reset", "-q", "--", *[f":(top,literal){r}" for r in rels], check=False)
             elif rels:
-                self._run("rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", *rels, check=False)
+                self._run("rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", *map(literal, rels), check=False)
             self._run("add", "-A", "--", ".", *specs)
             if self._run("diff", "--cached", "--quiet", check=False).returncode == 0:
                 return None
@@ -386,13 +416,13 @@ class GitRepo:
     def log(self, path: Path | None = None, n: int = 20) -> list[tuple[str, str, str]]:
         """Newest first (sha, committer ISO 8601 date, subject).
 
-        path filters with a plain pathspec (a folder matches everything under
-        it). No --follow: git only supports it for a single file, and skill
+        path filters with a literal pathspec (a folder matches everything
+        under it; '*', '[' and the like are plain characters). No --follow: git only supports it for a single file, and skill
         moves are recorded as their own commits anyway. Read-only: no lock taken.
         """
         args = ["log", f"-n{int(n)}", "--format=%H%x1f%cI%x1f%s"]
         if path is not None:
-            args += ["--", self._relative(path)]
+            args += ["--", literal(self._relative(path))]
         if not self._has_head():
             return []
         out = self._run(*args, read_only=True).stdout
@@ -472,7 +502,7 @@ class GitRepo:
         """Repo-relative paths of every file under *path* in commit *sha*. Read-only."""
         full = self.resolve_commit(sha)
         rel = self._relative(Path(path))
-        out = self._run("ls-tree", "-r", "-z", "--name-only", full, "--", rel, read_only=True).stdout
+        out = self._run("ls-tree", "-r", "-z", "--name-only", full, "--", literal(rel), read_only=True).stdout
         return sorted({p for p in out.split("\0") if p})
 
     def checkout_path(self, sha: str, path: Path | str) -> None:
@@ -484,7 +514,7 @@ class GitRepo:
         rel = self._relative(Path(path))
         with self.locked():
             full = self.resolve_commit(sha)
-            self._run("checkout", "-q", full, "--", rel)
+            self._run("checkout", "-q", full, "--", literal(rel))
 
     def matches(self, sha: str, path: Path | str) -> bool:
         """True when the work tree under *path* holds exactly commit *sha*'s files (no extra ones). Read-only."""

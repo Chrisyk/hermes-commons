@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from commons.core.fleet import Profile
+from commons.core.gitrepo import GitRepo
 from commons.core.group import TAKEN_OVER_KINDS, fingerprint, is_movable, same_content
 from commons.core.journal import operation, read_commons_config
 from commons.core.layout import Layout
@@ -92,9 +93,22 @@ def promote(
     name or several different ones, when the shared root holds a different
     copy of the name (merge instead), or when the target folder overlaps
     another shared skill. The other profiles that still load their own copy
-    are returned (check reports them as shadowed).
+    are returned (check reports them as shadowed). Every check runs with
+    the repo lock held, the same hold the change runs under.
     """
-    profiles = list(profiles)
+    with GitRepo(layout.shared_root).locked():
+        return _promote(name, from_profile, layout, list(profiles), md5_dir_hash, hub_hash, now)
+
+
+def _promote(
+    name: str,
+    from_profile: str,
+    layout: Layout,
+    profiles: list[Profile],
+    md5_dir_hash: Callable[[Path], str],
+    hub_hash: Callable[[Path], str],
+    now: datetime | None,
+) -> PromoteResult:
     source_profile = _profile(profiles, from_profile)
     mine = [
         c
@@ -172,8 +186,16 @@ def demote(
     create_dir), and the {name, profile} entry in .commons/config.json
     intentional_overrides keeps check from reporting it as shadowed.
     Refuses when the shared root has no such skill, or the profile already
-    has a copy of the name or something at the target folder.
+    has a copy of the name or something at the target folder. The checks
+    run with the repo lock held.
     """
+    with GitRepo(layout.shared_root).locked():
+        return _demote(name, to_profile, layout, profiles, now)
+
+
+def _demote(
+    name: str, to_profile: str, layout: Layout, profiles: Sequence[Profile], now: datetime | None
+) -> DemoteResult:
     profile = _profile(profiles, to_profile)
     source = next((c for c in _shared_copies(layout) if c.name == name), None)
     if source is None:

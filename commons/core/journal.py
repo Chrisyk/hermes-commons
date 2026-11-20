@@ -111,6 +111,10 @@ def _exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
 
+class JournalError(RuntimeError):
+    """An operation step refused because what it would move changed under it."""
+
+
 @dataclass
 class Operation:
     """One running operation: its backup, journal and the locked shared-root repo."""
@@ -180,9 +184,16 @@ class Operation:
         self.done.append(f"{profile}: retired {rel} into backup {self.backup_id}")
         return None
 
-    def retire_shared(self, name: str, rel: str) -> Path:
-        """Move the shared root's copy at *rel* into backups/<id>/retired/shared/<rel>."""
+    def retire_shared(self, name: str, rel: str, expected: str | None = None) -> Path:
+        """Move the shared root's copy at *rel* into backups/<id>/retired/shared/<rel>.
+
+        *expected* is its group.fingerprint when the caller checked it; it is
+        checked again right before the move, and a changed copy is never
+        moved (JournalError, nothing done).
+        """
         src = Path(self.layout.shared_root) / rel
+        if expected is not None and (not _exists(src) or fingerprint(src) != expected):
+            raise JournalError(f"{name}: the shared copy at {rel} changed; nothing retired")
         dst = retired_path(self.backup_dir, SHARED_LABEL, rel)
         args = {"name": name, "rel": rel, "src": str(src), "dst": str(dst), "fingerprint": tree_sha256(src)}
 
