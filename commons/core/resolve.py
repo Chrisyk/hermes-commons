@@ -49,8 +49,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from collections.abc import Callable, Iterable, MutableMapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from commons.core.fleet import Profile
@@ -68,7 +68,26 @@ TIER_NAMES = {
 # Mirror of Hermes agent/skill_utils.py _NAMESPACE_RE.
 _NAMESPACE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-ScanCache = MutableMapping[tuple[Path, str], list[SkillCopy]]
+
+@dataclass
+class ScanCache:
+    """Root scans and frontmatter reads shared between profiles, so each root is scanned once."""
+
+    scans: dict[Path, list[SkillCopy]] = field(default_factory=dict)
+    frontmatter: dict[tuple[Path, bool], dict] = field(default_factory=dict)
+    mds: dict[Path, list[tuple[str, Path]]] = field(default_factory=dict)
+    scan_calls: int = 0
+
+    def md_files(self, root: Path) -> list[tuple[str, Path]]:
+        if root not in self.mds:
+            self.mds[root] = _md_files(root)
+        return self.mds[root]
+
+    def read(self, skill_md: Path, strict: bool = False) -> dict:
+        key = (skill_md, strict)
+        if key not in self.frontmatter:
+            self.frontmatter[key] = read_frontmatter(skill_md, strict=strict)
+        return self.frontmatter[key]
 
 
 @dataclass
@@ -204,7 +223,7 @@ def _lookup_error(name: str) -> bool:
     return ".." in Path(candidate).parts
 
 
-def index_name(skill_md: Path) -> str:
+def index_name(skill_md: Path, cache: ScanCache | None = None) -> str:
     """The name a SKILL.md is listed under in the Hermes system-prompt index.
 
     Mirror of Hermes agent/prompt_builder.py _parse_skill_file (strict UTF-8,
@@ -212,7 +231,8 @@ def index_name(skill_md: Path) -> str:
     default the folder name) and _entry_name (empty falls back to the folder).
     """
     folder = skill_md.parent.name
-    return str(read_frontmatter(skill_md, strict=True).get("name", folder)) or folder
+    fm = cache.read(skill_md, strict=True) if cache is not None else read_frontmatter(skill_md, strict=True)
+    return str(fm.get("name", folder)) or folder
 
 
 @dataclass(frozen=True)
@@ -237,6 +257,7 @@ class SkillIndex:
     """Everything locate() needs for one profile: its roots and what each root's walk reaches."""
 
     roots: list[Root]
+    cache: ScanCache
     found: dict[Path, list[_Found]]  # root path -> SKILL.md entries sorted by path string
     mds: dict[Path, list[tuple[str, Path]]]  # root path -> every *.md below it (rglob order)
     _adhoc: dict[Path, SkillCopy] = field(default_factory=dict)
@@ -246,13 +267,12 @@ class SkillIndex:
             yield from self.found[root.path]
 
 
-def _scan(root: Root, md5_dir_hash, hub_hash, cache: ScanCache | None) -> list[SkillCopy]:
-    if cache is None:
-        return scan_root(root.path, root.label, md5_dir_hash, hub_hash)
-    key = (root.path, root.label)
-    if key not in cache:
-        cache[key] = scan_root(root.path, root.label, md5_dir_hash, hub_hash)
-    return cache[key]
+def _scan(root: Root, md5_dir_hash, hub_hash, cache: ScanCache) -> list[SkillCopy]:
+    """scan_root of *root*, once per root path when a *cache* is given (copies relabelled per profile)."""
+    if root.path not in cache.scans:
+        cache.scan_calls += 1
+        cache.scans[root.path] = scan_root(root.path, root.label, md5_dir_hash, hub_hash)
+    return [c if c.profile == root.label else replace(c, profile=root.label) for c in cache.scans[root.path]]
 
 
 def _is_legacy_flat(p: Path, root: Path) -> bool:
@@ -292,6 +312,7 @@ def build_index(
     cache: ScanCache | None = None,
 ) -> SkillIndex:
     """Scan every search root of *profile* once; *cache* shares root scans between profiles."""
+    cache = cache if cache is not None else ScanCache()
     roots = search_roots(profile, project_dirs)
     scans = {r.path: {c.path: c for c in _scan(r, md5_dir_hash, hub_hash, cache)} for r in roots}
     found: dict[Path, list[_Found]] = {}
@@ -301,10 +322,10 @@ def build_index(
             owner = owning_root(path, roots)
             own = scans[owner.path].get(path, copy) if owner is not None else copy
             md = path / SKILL_FILE
-            entries.append(_Found(md, own, path.name, read_frontmatter(md).get("name")))
+            entries.append(_Found(md, own, path.name, cache.read(md).get("name")))
         found[root.path] = sorted(entries, key=lambda f: str(f.file))
-    mds = {r.path: _md_files(r.path) for r in roots}
-    return SkillIndex(roots, found, mds)
+    mds = {r.path: cache.md_files(r.path) for r in roots}
+    return SkillIndex(roots, cache, found, mds)
 
 
 def _adhoc_copy(index: SkillIndex, root: Root, path: Path) -> SkillCopy:
@@ -408,6 +429,12 @@ def locate(index: SkillIndex, name: str) -> Resolution:
     return _pick(name, cands)
 
 
+def resolve_index(index: SkillIndex) -> dict[str, Resolution]:
+    """Every declared skill name in *index*, answered as Hermes skill_view(name) would."""
+    names = {index_name(f.file, index.cache) for f in index.copies()}
+    return {name: locate(index, name) for name in sorted(names)}
+
+
 def resolve(
     profile: Profile,
     md5_dir_hash: Callable[[Path], str],
@@ -416,6 +443,4 @@ def resolve(
     cache: ScanCache | None = None,
 ) -> dict[str, Resolution]:
     """Every declared skill name visible to *profile*, answered as Hermes skill_view(name) would."""
-    index = build_index(profile, md5_dir_hash, hub_hash, project_dirs, cache)
-    names = {index_name(f.file) for f in index.copies()}
-    return {name: locate(index, name) for name in sorted(names)}
+    return resolve_index(build_index(profile, md5_dir_hash, hub_hash, project_dirs, cache))
