@@ -312,7 +312,22 @@ def scan_profile(
     hub_hash: Callable[[Path], str],
 ) -> list[SkillCopy]:
     """Return every skill copy in p.skills_dir with provenance, sorted by rel."""
-    skills_dir = p.skills_dir
+    return scan_root(p.skills_dir, p.name, md5_dir_hash, hub_hash)
+
+
+def scan_root(
+    root: Path,
+    label: str,
+    md5_dir_hash: Callable[[Path], str],
+    hub_hash: Callable[[Path], str],
+) -> list[SkillCopy]:
+    """Return every skill copy under any skills root (profile, shared, external, project).
+
+    Copies carry *label* as their profile. Provenance reads .bundled_manifest
+    and .hub/lock.json at *root* when present; without them every copy not
+    reached through a symlink is 'own'. A missing root yields [].
+    """
+    skills_dir = Path(root)
     if not _is_dir(skills_dir):
         return []
     manifest = read_manifest(skills_dir)
@@ -326,7 +341,7 @@ def scan_profile(
         target = Path(os.path.realpath(path)) if os.path.islink(path) else None
         copies.append(
             SkillCopy(
-                profile=p.name,
+                profile=label,
                 name=name,
                 rel=found.rel,
                 path=path,
