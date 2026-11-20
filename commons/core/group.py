@@ -245,6 +245,21 @@ def _content(directory: Path) -> dict[str, _File]:
     return out
 
 
+@dataclass(frozen=True)
+class FileView:
+    """One entry of a skill tree as grouping reads it (public view of _File, for merge validation)."""
+
+    rel: str
+    kind: Literal["text", "binary", "link", "dir"]
+    lines: tuple[str, ...]
+    digest: str
+
+
+def file_views(directory: Path) -> list[FileView]:
+    """Every entry of _content(directory), sorted by rel; folders keep their trailing '/'. Raises OSError."""
+    return [FileView(rel, f.kind, f.lines, f.digest) for rel, f in sorted(_content(Path(directory)).items())]
+
+
 def _identity(content: dict[str, _File]) -> frozenset[tuple[str, str, bool, str]]:
     """Exact identity of a content view: rel path, kind, executable bit and raw-byte digest per entry.
 
