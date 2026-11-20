@@ -23,7 +23,10 @@ on), takes a 'pre-restore' backup, then:
   the journal; a missing retired copy is taken from the backup's skills/
   snapshot (when its hash matches), a changed one is reported and left;
   if something is at the original place now, the copy stays in the backup;
-- cron jobs.json: written back the sha-or-report way, under Hermes' cron lock.
+- cron jobs.json: written back the sha-or-report way, under Hermes' cron lock;
+- profile_copy intents (a shared skill copied into a profile by demote,
+  journal.py): the copy is moved aside into the pre-restore backup's
+  displaced/ folder, never deleted, when its tree_sha256 still matches.
 
 The shared root is never modified: copies into it, commits and markdown
 rewrites there are kept (markdown rewrites and partial copies are listed).
@@ -136,6 +139,7 @@ class RestorePlan:
     shared_changes: list[SharedChange] = field(default_factory=list)
     shadowed_after: list[tuple[str, str]] = field(default_factory=list)  # (profile, name)
     homes: dict[str, Path] = field(default_factory=dict)  # profile -> home, from the journal
+    profile_copies: list[dict[str, Any]] = field(default_factory=list)  # demote copies to move aside
 
     @property
     def layout(self) -> Layout:
@@ -268,6 +272,8 @@ def plan_restore(layout: Layout, backup_id: str) -> RestorePlan:
                 )
             elif current != args["sha_before"]:
                 plan.undecided.append(f"shared root: {args['path']} changed since setup rewrote it; kept")
+        elif op == "profile_copy" and _exists(Path(args["dst"])):
+            plan.profile_copies.append(dict(args))
         elif op == "copy" and i["state"] == PENDING and _exists(Path(args["target"])):
             plan.partial_copies.append(args["target"])
     plan.configs = list(configs.values())
@@ -458,6 +464,19 @@ def _copy_new(
             result.done.append(f"{profile}: copied shared {name} to {dest}")
 
 
+def _undo_profile_copy(args: Mapping[str, Any], result: RestoreResult) -> None:
+    """Move a copy demote wrote into a profile aside (never deleted), unless it changed since."""
+    dst = Path(args["dst"])
+    if not _exists(dst):
+        return
+    if args.get("fingerprint") is None or tree_sha256(dst) != args["fingerprint"]:
+        result.reports.append(f"{args['profile']}: {dst} changed since it was copied in; left alone")
+        return
+    aside = result.pre_restore_dir / "displaced" / args["profile"] / args["rel"]
+    move_noreplace(dst, aside)
+    result.done.append(f"{args['profile']}: {args['rel']} moved aside to {aside}")
+
+
 @contextlib.contextmanager
 def _shared_lock(shared_root: Path) -> Iterator[None]:
     """The shared root's git lock, when there is a shared root to lock (never created here)."""
@@ -536,6 +555,9 @@ def _restore_all(
         _restore_config(cfg, profile, writer, shared, result)
 
     _copy_new(plan, by_name, copy_new_to, result)
+
+    for pc in reversed(plan.profile_copies):
+        _undo_profile_copy(pc, result)
 
     for r in reversed(plan.retired):
         _restore_retired(r, result)
