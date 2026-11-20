@@ -9,7 +9,7 @@ description = "One live skill library for every Hermes profile."
 license = { text = "MIT" }
 authors = [{ name = "Christopher Ko" }]
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6"]
+dependencies = ["PyYAML>=6.0,<7"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "ruff>=0.6"]
