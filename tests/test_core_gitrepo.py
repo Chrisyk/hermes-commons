@@ -464,3 +464,17 @@ def test_exists_at(repo):
     assert not repo.exists_at(first, "b")
     with pytest.raises(ValueError):
         repo.exists_at("main", "a")
+
+
+@pytest.mark.parametrize("first", [False, True])
+def test_commit_all_exclude_never_commits_excluded_paths(repo, first):
+    if first:
+        _write(repo.path / "base.txt", "b\n")
+        repo.commit_all("base")
+    _write(repo.path / "keep.txt", "k\n")
+    _write(repo.path / "d [x]" / "partial.txt", "half\n")
+    _git(repo.path, "add", "-A")  # an earlier staged change under the excluded path must not ride along
+    assert repo.commit_all("snap", exclude=[repo.path / "d [x]"])
+    tracked = _git(repo.path, "ls-files").splitlines()
+    assert "keep.txt" in tracked and not any(t.startswith("d [x]") for t in tracked)
+    assert (repo.path / "d [x]" / "partial.txt").read_text() == "half\n"

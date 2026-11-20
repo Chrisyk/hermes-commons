@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -357,11 +357,22 @@ class GitRepo:
             self._run("commit", "-q", "-m", message, "--", *rels, identity=True)
             return self._head()
 
-    def commit_all(self, message: str) -> str | None:
-        """Stage and commit everything in the work tree; None if nothing changed."""
+    def commit_all(self, message: str, exclude: Iterable[Path] = ()) -> str | None:
+        """Stage and commit everything in the work tree but *exclude*; None if nothing changed.
+
+        *exclude* paths (absolute or repo-relative, files or folders) are
+        neither staged nor committed; an earlier staged change under one is
+        unstaged first, so it can never ride along.
+        """
+        rels = [self._relative(p) for p in exclude]
+        specs = [f":(exclude,top,literal){r}" for r in rels]
         with self.locked():
             self._ensure_excluded()
-            self._run("add", "-A")
+            if rels and self._has_head():
+                self._run("reset", "-q", "--", *[f":(top,literal){r}" for r in rels], check=False)
+            elif rels:
+                self._run("rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", *rels, check=False)
+            self._run("add", "-A", "--", ".", *specs)
             if self._run("diff", "--cached", "--quiet", check=False).returncode == 0:
                 return None
             self._run("commit", "-q", "-m", message, identity=True)
