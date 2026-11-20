@@ -154,6 +154,11 @@ def setup_fn(parser: argparse.ArgumentParser) -> None:
         metavar="S=P[,P]",
         help="also copy shared skill S, new since the backup, into these profiles",
     )
+    p.add_argument(
+        "--cascade",
+        action="store_true",
+        help="first restore every later operation not restored yet, newest first",
+    )
     p.add_argument("--yes", action="store_true")
 
 
@@ -690,6 +695,12 @@ def cmd_restore(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         return 0
     copy_to = _copy_new_to(args.copy_new_to)
     plan = restore_mod.plan_restore(layout, args.backup_id)
+    cascade = getattr(args, "cascade", False)
+    if plan.later and not cascade:
+        raise restore_mod.RestoreError(restore_mod.later_operations_message(plan.backup_id, plan.later))
+    if plan.later:
+        out.write(f"first restore {len(plan.later)} later operation(s), newest first:\n")
+        out.writelines(f"  {bid}\n" for bid in plan.later)
     out.write(f"restore {plan.backup_id} ({plan.kind or 'setup'}):\n")
     out.write(f"  config.yaml of {len(plan.configs)} profile(s) put back\n")
     out.write(f"  {len(plan.retired)} retired copy(ies) moved back\n")
@@ -703,10 +714,16 @@ def cmd_restore(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     code = _asked("Restore it?", args, out, err)
     if code is not None:
         return code
-    res = restore_mod.restore(plan, profiles, _writer(), copy_new_to=copy_to or None)
-    out.write(f"restored {plan.backup_id} (a pre-restore backup is {res.pre_restore_backup_id})\n")
-    _lines(out, "done", res.done)
-    _lines(out, "reports", res.reports)
+    if cascade:
+        steps = restore_mod.restore_cascade(
+            layout, plan.backup_id, profiles, _writer(), copy_new_to=copy_to or None
+        ).restored
+    else:
+        steps = [(plan.backup_id, restore_mod.restore(plan, profiles, _writer(), copy_new_to=copy_to or None))]
+    for bid, res in steps:
+        out.write(f"restored {bid} (a pre-restore backup is {res.pre_restore_backup_id})\n")
+        _lines(out, "done", res.done)
+        _lines(out, "reports", res.reports)
     return 0
 
 

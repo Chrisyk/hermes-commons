@@ -48,6 +48,13 @@ partial copies a resume set aside into the backup are listed). Putting back
 what a Phase 4 operation moved out of the shared root (retire_shared,
 set_aside) is the one case restore writes a skill into the shared root.
 Every run is appended to backups/<id>/restore.json. Stdlib + PyYAML only.
+
+Order: operations are undone newest first. restore() refuses (RestoreError,
+nothing changed) while any later commons operation (a backup with a journal,
+made after this one, not restored yet) exists, and lists them: undoing an
+old setup under a later merge would put back copies the merge then retired,
+or leave a name missing everywhere. restore_cascade() restores every such
+later operation, newest first, and then this one.
 """
 
 from __future__ import annotations
@@ -61,6 +68,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from commons.core.apply import JOURNAL as JOURNAL_FILE
 from commons.core.apply import JOURNAL_VERSION, PENDING, config_states, intents, newest_writes
 from commons.core.backup import (
     MANIFEST,
@@ -162,6 +170,7 @@ class RestorePlan:
     homes: dict[str, Path] = field(default_factory=dict)  # profile -> home, from the journal
     ops: list[dict[str, Any]] = field(default_factory=list)  # Phase 4 intents, undone newest first
     kind: str | None = None  # the journal's command (merge, promote, ...); None for a setup
+    later: list[str] = field(default_factory=list)  # later operations not restored yet, newest first
 
     @property
     def layout(self) -> Layout:
@@ -202,6 +211,51 @@ def _shared_changes(shared_root: Path, since: str | None) -> list[SharedChange]:
             status = "changed" if since is not None and repo.exists_at(since, c.rel) else "new"
             out.append(SharedChange(c.name, c.rel, status))
     return out
+
+
+def _order_key(layout: Layout, backup_id: str) -> tuple[int, str, str]:
+    """When a backup was made: its manifest's mtime, then the manifest's 'created', then the id.
+
+    The mtime comes first because 'created' is the caller's clock (tests and
+    resumes pass their own); the manifest is written once, when the backup is.
+    """
+    d = layout.backup_dir(backup_id)
+    created = ""
+    mtime = 0
+    try:
+        manifest = json.loads((d / MANIFEST).read_text(encoding="utf-8"))
+        created = str(manifest.get("created", "")) if isinstance(manifest, dict) else ""
+        mtime = (d / MANIFEST).stat().st_mtime_ns
+    except (OSError, ValueError):
+        pass
+    return mtime, created, backup_id
+
+
+def operations(layout: Layout) -> list[str]:
+    """Ids of every commons operation (a backup with a journal) not restored yet, oldest first."""
+    root = Path(layout.backups_dir)
+    if not root.is_dir():
+        return []
+    ids = [
+        d.name
+        for d in root.iterdir()
+        if d.is_dir() and (d / JOURNAL_FILE).is_file() and not (d / RESTORE_LOG).exists()
+    ]
+    return sorted(ids, key=lambda bid: _order_key(layout, bid))
+
+
+def later_operations(layout: Layout, backup_id: str) -> list[str]:
+    """Operations made after *backup_id* and not restored yet, newest first (see module docstring)."""
+    mine = _order_key(layout, backup_id)
+    return [bid for bid in reversed(operations(layout)) if bid != backup_id and _order_key(layout, bid) > mine]
+
+
+def later_operations_message(backup_id: str, later: Sequence[str]) -> str:
+    return (
+        f"backup {backup_id} has later commons operations that are not restored yet (newest first): "
+        + ", ".join(later)
+        + f"; restore them first, or restore {backup_id} with --cascade to restore them all, newest first"
+    )
 
 
 def load_restore_journal(layout: Layout, backup_id: str) -> dict[str, Any]:
@@ -373,6 +427,7 @@ def plan_restore(layout: Layout, backup_id: str) -> RestorePlan:
     if plan.kind is None:  # a setup: shared-root edits since are kept and listed
         plan.shared_changes = _shared_changes(plan.shared_root, since)
     plan.shadowed_after = _shadowed_after(plan)
+    plan.later = later_operations(layout, backup_id)
     return plan
 
 
@@ -801,7 +856,8 @@ def restore(
     """Carry out *plan* (see module docstring). Raises ValueError for a bad copy_new_to.
 
     *profiles* are the fleet as it is now; journal profiles missing from it
-    are reported and skipped.
+    are reported and skipped. Raises RestoreError, changing nothing, while a
+    later operation is not restored yet (see restore_cascade).
     """
     copy_new_to = dict(copy_new_to or {})
     by_name = {p.name: p for p in profiles}
@@ -814,6 +870,9 @@ def restore(
             raise ValueError(f"copy_new_to: unknown profiles {unknown} for {name!r}")
     layout = plan.layout
     with _shared_lock(plan.shared_root):
+        later = later_operations(layout, plan.backup_id)
+        if later:
+            raise RestoreError(later_operations_message(plan.backup_id, later))
         problems = _backup_problems(layout, plan.backup_id)
         bid = create_backup(layout, profiles, "pre-restore", now=now)
         result = RestoreResult(pre_restore_backup_id=bid, pre_restore_dir=layout.backup_dir(bid))
@@ -824,6 +883,35 @@ def restore(
             {"pre_restore_backup_id": bid, "done": result.done, "reports": result.reports},
         )
     return result
+
+
+@dataclass
+class CascadeResult:
+    restored: list[tuple[str, RestoreResult]] = field(default_factory=list)  # in the order run
+
+
+def restore_cascade(
+    layout: Layout,
+    backup_id: str,
+    profiles: list[Profile],
+    writer: ConfigWriter,
+    copy_new_to: Mapping[str, Sequence[str]] | None = None,
+    now: datetime | None = None,
+) -> CascadeResult:
+    """Restore every later operation of *backup_id*, newest first, then *backup_id* itself.
+
+    Each step plans afresh against the fleet as the previous step left it
+    (config.yaml re-read from every profile home). *copy_new_to* applies to
+    *backup_id* only. Stops at the first RestoreError; what was restored
+    until then stays restored (each step has its own pre-restore backup).
+    """
+    out = CascadeResult()
+    for bid in [*later_operations(layout, backup_id), backup_id]:
+        fleet = [Profile(p.name, p.home, load_config(Path(p.home) / CONFIG_FILE)) for p in profiles]
+        plan = plan_restore(layout, bid)
+        extra = copy_new_to if bid == backup_id else None
+        out.restored.append((bid, restore(plan, fleet, writer, copy_new_to=extra, now=now)))
+    return out
 
 
 def _restore_all(

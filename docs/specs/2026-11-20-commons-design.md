@@ -86,7 +86,7 @@ Measured on Chris's fleet: containment resolved 11 of 53; 42 needed a real merge
 | `demote S --to P` | Copy a shared skill into one profile's own folder (an intentional private override) and record it as intentional so `check` stops flagging it. | Yes, after confirm |
 | `merge [--next \| --accept S \| --skip S]` | Agent-assisted conflict merge (below). | `--accept` only |
 | `log [S]`, `undo S [--to COMMIT]` | Git history of a skill; revert one edit or roll a skill back. | undo: yes |
-| `restore [BACKUP_ID]` | Put every profile's config.yaml and skills folder back as they were before a setup/promote/demote. | Yes, after confirm |
+| `restore [BACKUP_ID] [--cascade]` | Put every profile's config.yaml and skills folder back as they were before a setup/promote/demote/merge. Operations are undone newest first: restore refuses, listing them, while later operations are not restored yet; `--cascade` restores those first, newest first. | Yes, after confirm |
 
 All writing commands show what they will do and ask; `--yes` skips the question; with no TTY and no `--yes` they exit non-zero with a message.
 

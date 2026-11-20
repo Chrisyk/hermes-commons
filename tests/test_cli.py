@@ -379,3 +379,52 @@ def test_missing_dependencies_give_one_clear_message(tmp_path):
     assert "RC 1" in proc.stdout
     assert "SLASH commons cannot load its dependencies" in proc.stdout
     assert "hermes pm repair" in proc.stderr
+
+
+def _merge_conflict(env):
+    assert run("merge", "--skip", "bundled-edited", "--yes") == 0
+    assert run("merge", "--next", "--seed", "variant:default") == 0
+    md = env["state"] / "staging" / "conflict" / "SKILL.md"
+    md.write_text(md.read_text(encoding="utf-8") + "D_device_only\n", encoding="utf-8")
+    assert run("merge", "--accept", "conflict", "--yes") == 0
+
+
+def test_restore_refuses_while_later_operations_are_not_restored(env, capsys):
+    before = snapshot(env["root"])
+    applied(env)
+    setup_id = list_backups(env["layout"])[0]
+    _merge_conflict(env)
+    after_merge = snapshot(env["root"])
+    capsys.readouterr()
+    assert run("restore", setup_id, "--yes") == 1
+    err = capsys.readouterr().err
+    assert "later commons operations" in err and "--cascade" in err
+    assert "merge-conflict" in err and "skip-bundled-edited" in err
+    assert err.index("merge-conflict") < err.index("skip-bundled-edited")  # newest first
+    assert snapshot(env["root"]) == after_merge  # nothing changed
+    assert run("restore", setup_id, "--cascade") == 2  # still asks
+    assert run("restore", setup_id, "--cascade", "--yes") == 0
+    out = capsys.readouterr().out
+    assert out.index("restored") < out.index(f"restored {setup_id}")
+    assert snapshot(env["root"]) == before  # byte-identical skills trees and config.yaml
+    assert run("restore") == 0
+    rows = capsys.readouterr().out
+    assert rows.count("(restored)") == 3
+
+
+def test_restore_cascade_core_order(env):
+    from commons.core.restore import RestoreError, later_operations, plan_restore, restore, restore_cascade
+
+    applied(env)
+    lay = env["layout"]
+    setup_id = list_backups(lay)[0]
+    _merge_conflict(env)
+    later = later_operations(lay, setup_id)
+    assert [b.split("-", 1)[1] for b in later] == ["merge-conflict", "skip-bundled-edited"]
+    with pytest.raises(RestoreError, match="later commons operations"):
+        restore(plan_restore(lay, setup_id), discover(env["root"]), YamlFileWriter())
+    # the newest one on its own is fine, then the next
+    restore(plan_restore(lay, later[0]), discover(env["root"]), YamlFileWriter())
+    assert later_operations(lay, setup_id) == later[1:]
+    res = restore_cascade(lay, setup_id, discover(env["root"]), YamlFileWriter())
+    assert [bid for bid, _r in res.restored] == [later[1], setup_id]
