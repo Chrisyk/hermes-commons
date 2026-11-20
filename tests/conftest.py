@@ -18,10 +18,10 @@ def _classic_spec() -> dict:
         "SKILL.md": skill_md("same", "Identical everywhere.", ["S1", "S2"]),
         "notes.txt": "shared notes\n",
     }
-    contained_small = {"SKILL.md": skill_md("contained", "Contained skill.", ["L1", "L2", "L3", "L4"])}
-    contained_big = {
-        "SKILL.md": skill_md("contained", "Contained skill.", ["L1", "L2", "L3", "L4", "L5", "L6"])
-    }
+    # Lines are long enough to survive grouping's skip of lines shorter than 4 chars.
+    contained_lines = [f"contained line {i}" for i in range(1, 7)]
+    contained_small = {"SKILL.md": skill_md("contained", "Contained skill.", contained_lines[:4])}
+    contained_big = {"SKILL.md": skill_md("contained", "Contained skill.", contained_lines)}
     pristine = {"SKILL.md": skill_md("bundled-pristine", "Bundled and untouched.", ["P1", "P2"])}
     edited_lines = ["E1", "E2"]
     edited_origin = {"SKILL.md": skill_md("bundled-edited", "Bundled then edited.", edited_lines)}
