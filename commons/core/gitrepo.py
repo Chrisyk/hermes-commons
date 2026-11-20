@@ -441,6 +441,46 @@ class GitRepo:
         proc = self._run("cat-file", "-e", f"{sha}:{rel}", check=False, read_only=True)
         return proc.returncode == 0
 
+    def resolve_commit(self, sha: str) -> str:
+        """Full commit id of *sha* (7 to 40 lowercase hex digits); GitError if it is no commit. Read-only."""
+        if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+            raise ValueError(f"bad commit sha {sha!r}: use 7 to 40 lowercase hex digits")
+        return self._run("rev-parse", "--verify", "-q", f"{sha}^{{commit}}", read_only=True).stdout.strip()
+
+    def files_in_commit(self, sha: str) -> list[str]:
+        """Repo-relative paths commit *sha* changed against its first parent (as git show --name-only). Read-only."""
+        full = self.resolve_commit(sha)
+        out = self._run(
+            "diff-tree",
+            "--root",
+            "-r",
+            "-z",
+            "--no-renames",
+            "--name-only",
+            "--no-commit-id",
+            full,
+            read_only=True,
+        ).stdout
+        return sorted({p for p in out.split("\0") if p})
+
+    def files_at(self, sha: str, path: Path | str) -> list[str]:
+        """Repo-relative paths of every file under *path* in commit *sha*. Read-only."""
+        full = self.resolve_commit(sha)
+        rel = self._relative(Path(path))
+        out = self._run("ls-tree", "-r", "-z", "--name-only", full, "--", rel, read_only=True).stdout
+        return sorted({p for p in out.split("\0") if p})
+
+    def checkout_path(self, sha: str, path: Path | str) -> None:
+        """`git checkout <sha> -- <path>`: the work tree and index of *path* as in commit *sha*.
+
+        Files under *path* that *sha* does not have are left alone (git does
+        not remove them); the caller moves them aside first.
+        """
+        rel = self._relative(Path(path))
+        with self.locked():
+            full = self.resolve_commit(sha)
+            self._run("checkout", "-q", full, "--", rel)
+
     def revert(self, sha: str) -> str:
         """Revert one commit with a new commit and return its sha. Aborts cleanly on conflict.
 
