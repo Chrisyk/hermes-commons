@@ -1,6 +1,6 @@
 # commons: one skill library for every Hermes profile
 
-Status: draft for Chris's final approval, 2026-11-20 (builder check done, Q1=A, Q2=A). Working name `commons` (free in the plugin catalog).
+Status: draft for Chris's final approval, 2026-11-20 (approved; Q1 revised to plugin-shipped skill, Q2=A). Working name `commons` (free in the plugin catalog).
 
 ## Intent
 
@@ -32,7 +32,7 @@ It is also a public portfolio project: it gets published on GitHub, submitted to
 
 - Losing any skill content. Nothing is ever deleted; replaced copies move to a backups folder.
 - Touching anything without an explicit approval in setup.
-- Adding tool schemas or per-turn text to the prompt. The only prompt cost is the one index row of the `commons` skill (about 80 chars).
+- Adding tool schemas or per-turn text to the prompt. The only prompt cost is the one index row of the plugin's `commons:commons` skill (about 80 chars), and only in profiles where commons is enabled.
 - Patching Hermes internals or importing undocumented core modules (catalog rule 9; validator warnings).
 - Network calls of any kind.
 
@@ -115,12 +115,12 @@ The agent does the merging inside a normal chat, steered by the commons skill; c
 
 - **Per-edit commits.** `on_skill_lifecycle` handler: resolve the skill name to a folder with `locate_skill`; if it is inside the shared root, `git add` that folder and commit `"<action> <skill> (profile <p>, session <id>)"`. A file lock under `.commons/` serializes git operations across profiles and processes. Failures are logged, never raised into the agent turn.
 - **Session start.** `on_session_start` runs a cheap shadow check for the active profile only (cached by folder mtimes). New findings are logged and shown by `status`/`check`. Decision: commons injects no prompt text; the commons skill tells the agent to run `hermes commons check` before editing a skill that might be shadowed.
-- **check** reports: profiles where the commons plugin is not enabled; a missing or altered `commons` skill; taken-over bundled/hub skills whose source has a newer version; shadowed shared skills (except ones recorded as intentional by demote); profiles whose create_dir is missing or points elsewhere; uncommitted changes in the shared root; stale skill paths in cron jobs and skills; frontmatter that does not parse or name/folder mismatches; missing referenced files; SKILL.md over a size threshold.
+- **check** reports: profiles where the commons plugin is not enabled; taken-over bundled/hub skills whose source has a newer version; shadowed shared skills (except ones recorded as intentional by demote); profiles whose create_dir is missing or points elsewhere; uncommitted changes in the shared root; stale skill paths in cron jobs and skills; frontmatter that does not parse or name/folder mismatches; missing referenced files; SKILL.md over a size threshold.
 - **Scheduled check.** At the end of setup, offer to create a script-only cron job (no model call) running `hermes commons check --fix-safe --quiet` hourly. It is created through `hermes cron create`, and only if the user accepts.
 
 ### The commons skill
 
-Short (well under 2k chars), description 60 chars or less. Says: shared skills live in the shared root and are edited in place; never copy a shared skill into a profile's folder (use `demote` if a private override is really wanted); use `promote` to share a profile skill; run `check` before and after skill maintenance; how to run an agent merge. Shipped as a template in the plugin and written into the shared root by setup as a normal skill, so it appears in every profile's skill index (plugin-registered skills are not indexed).
+Short (well under 2k chars), description 60 chars or less. Says: shared skills live in the shared root and are edited in place; never copy a shared skill into a profile's folder (use `demote` if a private override is really wanted); use `promote` to share a profile skill; run `check` before and after skill maintenance; how to run an agent merge. Shipped inside the plugin (`commons/skills/commons/SKILL.md`) and registered with `ctx.register_skill`. Hermes lists registered plugin skills in `<available_skills>` under a `plugin` category as `commons:commons`, only in profiles where the plugin is enabled (agent/prompt_builder.py `_plugin_skill_prompt_rows`, verified 2026-11-20). It is read-only to agents and updates with the plugin, so setup writes nothing for it and `check` does not watch it.
 
 ### State
 
@@ -145,7 +145,7 @@ Short (well under 2k chars), description 60 chars or less. Says: shared skills l
 
 Verified against Hermes v0.23.1 source; marked as Shelly's call unless noted.
 
-1. Plugin skills (`ctx.register_skill`) are NOT listed in `<available_skills>` (plugins/index.md, "Key properties"), so a registered commons skill would never be seen. Chris chose: setup writes a normal `commons` skill into the shared root (one index row, about 80 chars, in every prompt). The plugin ships the template; setup installs it as its own proposal line; `check` reports if it is missing or edited away from the template; restore leaves it in the shared root like any other shared skill.
+1. The commons skill. First decision (Q1=A) was to write a normal skill into the shared root, based on plugins/index.md saying plugin skills are not indexed. The source says otherwise: `_plugin_skill_prompt_rows` (agent/prompt_builder.py ~1196) lists every skill an ENABLED plugin registers, under category `plugin`, as `commons:commons`. Chris switched (2026-11-20) to shipping it in the plugin via `ctx.register_skill`: present only where commons is enabled, read-only to agents, updated with the plugin, no setup step and nothing for `check` to watch. The docs page is stale; mention it upstream when submitting.
 2. Third-party plugins only run in profiles that list them in `plugins.enabled`, and the hook fires only in the profile that made the edit. Setup's proposal includes enabling commons in every profile (shown as its own line, approved with the rest); restore removes it again; `check` reports any profile where it is not enabled. Disclosure adds "writes plugins.enabled in each profile's config.yaml during setup/restore". (Shelly's call.)
 3. Restore after later work: restore puts back every profile's config.yaml and local skills folder from the backup and leaves the shared root untouched on disk. Before confirming, it lists skills created or changed in the shared root after setup and offers to copy each into the profiles that had it (or all profiles). Nothing in the shared root is deleted. (Shelly's call.)
 4. End-to-end acceptance on the sandbox fleet: the setup report must match the manual audit (246 names, 53 differing; 11 auto-resolved by containment, 42 conflicts), and identical plus contained groups must land in the shared root byte-identical to the manual consolidation. Agent merges are not compared to the manual merges; they are checked by the `merge --accept` validation (no variant line lost without being listed). (Shelly's call.)

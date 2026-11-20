@@ -25,7 +25,7 @@ Style rules for every task: no em-dashes anywhere (code, comments, tests, commit
 - Hub installs: `<profile>/skills/.hub/lock.json`, `{"installed": {name: {install_path, content_hash, ...}}}`.
 - Profiles: default root `hermes_constants.get_default_hermes_root()`; named profiles are `<root>/profiles/<name>/` with a config.yaml; skip ones where `hermes_constants.named_profile_is_deleted(path)` is true.
 - Script-only cron scripts must live under `<HERMES_HOME>/scripts/`.
-- Plugin skills registered with `ctx.register_skill` are NOT indexed; the commons skill is therefore written into the shared root as a normal skill.
+- Plugin skills registered with `ctx.register_skill` ARE indexed (category `plugin`, name `commons:commons`) in profiles where the plugin is enabled (agent/prompt_builder.py `_plugin_skill_prompt_rows`); plugins/index.md saying otherwise is stale. The commons skill ships in the plugin.
 
 ---
 
@@ -181,7 +181,7 @@ Phase 2 gate: full suite green.
 
 ### Task 3.1: Proposal model (`commons/core/proposal.py`)
 
-`build_proposal(profiles, groups, shared_root, cron_jobs) -> Proposal` containing: shared root path; `moves` (group name, chosen source copy, target rel under shared root; target rel follows the copy's rel in the profile furthest ahead); `conflicts` with default action `merge`; `stays_local`; `in_profile_dups`; `config_changes` per profile (`skills.create_dir`, add `commons` to `plugins.enabled`); `install_commons_skill: True`; `cron_rewrites` (job id, old path, new path) only where the new file will exist; `taken_over` entries with origin hashes. `Proposal.to_json()` / `from_json()` and `render_markdown()`. `apply_choice(proposal, "S=keep:P" | "S=merge")`.
+`build_proposal(profiles, groups, shared_root, cron_jobs) -> Proposal` containing: shared root path; `moves` (group name, chosen source copy, target rel under shared root; target rel follows the copy's rel in the profile furthest ahead); `conflicts` with default action `merge`; `stays_local`; `in_profile_dups`; `config_changes` per profile (`skills.create_dir`, add `commons` to `plugins.enabled`); `cron_rewrites` (job id, old path, new path) only where the new file will exist; `taken_over` entries with origin hashes. `Proposal.to_json()` / `from_json()` and `render_markdown()`. `apply_choice(proposal, "S=keep:P" | "S=merge")`.
 
 Tests: classic fleet proposal moves `same`, `contained` (device copy), `bundled-edited`; lists `conflict` as merge; leaves `bundled-pristine`, `hubskill`, `linked` local; flags `dup`; JSON round-trip equality; `keep:device` on `conflict` turns it into a move.
 
@@ -191,7 +191,7 @@ Tests: classic fleet proposal moves `same`, `contained` (device copy), `bundled-
 1. `create_backup(..., "setup")`.
 2. `git init` the shared root if needed; write `.gitignore` with `.commons/backups/`, `.commons/staging/`, `.commons/lock`.
 3. Copy each move's source into the shared root (`copytree`, refuse if target exists with different content).
-4. Write the commons skill from `commons/templates/commons/SKILL.md` to `<shared_root>/commons/SKILL.md`.
+4. (removed: the commons skill ships in the plugin, setup writes nothing for it)
 5. Commit "commons setup <ts>".
 6. For each profile: `writer.set(p, "skills.create_dir", shared_root)`; add `commons` to `plugins.enabled`.
 7. Retire every profile's local copy of a moved skill into the backup's `retired/`.
@@ -224,7 +224,7 @@ Phase 3 gate: end-to-end test `tests/test_setup_e2e.py` on the classic fleet: sc
 
 ### Task 4.2: Check (`commons/core/check.py`)
 
-`run_check(profiles, shared_root, bundled_hashes, hub_lock) -> list[Finding]` with `Finding(severity, code, profile, skill, message)`. Codes: `plugin-off`, `create-dir-missing`, `create-dir-elsewhere`, `commons-skill-missing`, `commons-skill-altered`, `shadowed`, `ambiguous`, `uncommitted`, `stale-path`, `bad-frontmatter`, `name-mismatch`, `missing-ref`, `oversize` (SKILL.md > 40,000 chars), `upstream-newer` (taken-over skill whose current bundled/hub hash differs from the recorded origin). `fix_safe(findings)` commits uncommitted changes only. Render as plain text; `--quiet` prints nothing when there are no warnings. One test per code.
+`run_check(profiles, shared_root, bundled_hashes, hub_lock) -> list[Finding]` with `Finding(severity, code, profile, skill, message)`. Codes: `plugin-off`, `create-dir-missing`, `create-dir-elsewhere`, `shadowed`, `ambiguous`, `uncommitted`, `stale-path`, `bad-frontmatter`, `name-mismatch`, `missing-ref`, `oversize` (SKILL.md > 40,000 chars), `upstream-newer` (taken-over skill whose current bundled/hub hash differs from the recorded origin). `fix_safe(findings)` commits uncommitted changes only. Render as plain text; `--quiet` prints nothing when there are no warnings. One test per code.
 
 ### Task 4.3: Promote and demote (`commons/core/moves.py` additions)
 
@@ -257,9 +257,9 @@ Test with monkeypatched fake modules in `sys.modules`.
 
 `setup_fn(parser)` adds subcommands `setup [--root PATH] [--choose S=...] [--apply] [--yes]`, `status [--profile] [--skill]`, `check [--fix-safe] [--quiet]`, `promote S [--from P]`, `demote S --to P`, `merge [--next|--accept S|--skip S] [--force]`, `log [S]`, `undo S [--to SHA]`, `restore [ID] [--yes]`. Writing commands print the plan and ask `[y/N]`; without a TTY and without `--yes` they exit 2 with "needs confirmation; rerun with --yes". `register(ctx)` registers hooks, `ctx.register_cli_command("commons", ...)` and `ctx.register_command("commons", slash_handler, args_hint="status|check")`, where the slash handler only allows `status` and `check`. Tests drive `handler_fn` with parsed args against the classic fleet (adapter monkeypatched).
 
-### Task 5.4: Commons skill template
+### Task 5.4: Commons skill (plugin-shipped)
 
-`commons/templates/commons/SKILL.md`, under 2,000 chars, description <= 60 chars ("Use when editing, sharing or merging skills across profiles."). Content per design: edit shared skills in place, never copy one into a profile (use demote), promote to share, run `hermes commons check` before and after skill maintenance, merge steps. Test: frontmatter parses, size limits hold.
+`commons/skills/commons/SKILL.md`, under 2,000 chars, description <= 60 chars ("Use when editing, sharing or merging skills across profiles."). Content per design. `register(ctx)` calls `ctx.register_skill("commons", Path(__file__).parent / "skills/commons/SKILL.md", description=...)` (Path, not str). Tests: frontmatter parses, size limits hold, register_skill is called with a Path. Phase 6 adopt test confirms `commons:commons` appears in a real profile's index once the plugin is enabled.
 
 ### Task 5.5: Scheduled check offer
 
