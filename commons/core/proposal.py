@@ -33,7 +33,15 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from commons.core.fleet import Profile
-from commons.core.group import Group, compare_variants, group, is_movable, profile_order, same_content
+from commons.core.group import (
+    Group,
+    compare_variants,
+    fingerprint,
+    group,
+    is_movable,
+    profile_order,
+    same_content,
+)
 from commons.core.layout import Layout, check_outside
 from commons.core.paths import find_stale_paths
 from commons.core.resolve import config_path
@@ -53,6 +61,9 @@ class Move:
     source_rel: str
     target_rel: str
     retire: list[tuple[str, str]] = field(default_factory=list)  # (profile, rel)
+    # "profile:rel" -> group.fingerprint at proposal time, for the source and every retire;
+    # apply refuses to run when any of them changed since.
+    fingerprints: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +80,7 @@ class CopyRef:
     rel: str
     kind: str
     origin_hash: str | None = None
+    fingerprint: str = ""
 
 
 @dataclass
@@ -150,7 +162,14 @@ class Proposal:
             shared_root=Path(d["shared_root"]),
             state_dir=Path(d["state_dir"]),
             moves=[
-                Move(m["name"], m["source_profile"], m["source_rel"], m["target_rel"], _pairs(m["retire"]))
+                Move(
+                    m["name"],
+                    m["source_profile"],
+                    m["source_rel"],
+                    m["target_rel"],
+                    _pairs(m["retire"]),
+                    dict(m["fingerprints"]),
+                )
                 for m in d["moves"]
             ],
             conflicts=[
@@ -297,7 +316,10 @@ def build_proposal(
         if status == "nested":
             prop.nested.append(g.name)
             continue
-        refs = [CopyRef(c.profile, c.rel, c.kind, c.origin_hash) for c in local]
+        refs = [CopyRef(c.profile, c.rel, c.kind, c.origin_hash, fingerprint(c.path)) for c in local]
+        prints = {f"{c.profile}:{c.rel}": r.fingerprint for c, r in zip(local, refs, strict=True)}
+        if shared:
+            prints[f"{SHARED}:{shared[0].rel}"] = fingerprint(shared[0].path)
         shared_rel = shared[0].rel if shared else None
         if status in ("identical", "contained"):
             keep = g.keep
@@ -307,12 +329,13 @@ def build_proposal(
                     Conflict(g.name, _variants(g, [keep, shared[0]]), copies=refs, shared_rel=shared_rel)
                 )
                 continue
+            retire = [(c.profile, c.rel) for c in local]
             if shared:
-                move = Move(g.name, SHARED, shared[0].rel, shared[0].rel, [(c.profile, c.rel) for c in local])
-                if not move.retire:
+                if not retire:
                     continue
+                move = Move(g.name, SHARED, shared[0].rel, shared[0].rel, retire, prints)
             else:
-                move = Move(g.name, keep.profile, keep.rel, keep.rel, [(c.profile, c.rel) for c in local])
+                move = Move(g.name, keep.profile, keep.rel, keep.rel, retire, prints)
             pending.append((g, move, status))
             continue
         # conflict
@@ -421,8 +444,17 @@ def apply_choice(prop: Proposal, choice: str) -> Proposal:
         known = ", ".join(v.profile for v in conflict.variants)
         raise ValueError(f"{name}: no variant from profile {who!r} (variants: {known})")
     retire = [(c.profile, c.rel) for c in conflict.copies]
+    prints = {f"{c.profile}:{c.rel}": c.fingerprint for c in conflict.copies}
     if who == SHARED:
-        move = Move(name, SHARED, variant.rel, variant.rel, retire)
+        shared_dir = Path(out.shared_root) / variant.rel
+        move = Move(
+            name,
+            SHARED,
+            variant.rel,
+            variant.rel,
+            retire,
+            {**prints, f"{SHARED}:{variant.rel}": fingerprint(shared_dir)},
+        )
     else:
         if conflict.shared_rel is not None:
             raise ValueError(
@@ -432,7 +464,7 @@ def apply_choice(prop: Proposal, choice: str) -> Proposal:
         clash = [m.name for m in out.moves if _overlaps(m.target_rel, target)]
         if clash:
             raise ValueError(f"{name}: target {target} overlaps the move of {', '.join(clash)}")
-        move = Move(name, who, variant.rel, target, retire)
+        move = Move(name, who, variant.rel, target, retire, prints)
     out.conflicts.remove(conflict)
     out.moves.append(move)
     out.moves.sort(key=lambda m: m.name)

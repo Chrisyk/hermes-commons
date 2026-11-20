@@ -334,4 +334,4 @@ def test_hashing_reads_in_chunks(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "read_bytes", lambda self: pytest.fail("whole-file read"))
     assert tree_sha256(tree) == expected.hexdigest()
     assert sizes and all(0 < n <= 1024 * 1024 for n in sizes)
-    assert backup._file_sha256(tree / "big.bin") == hashlib.sha256(big).hexdigest()
+    assert backup.file_sha256(tree / "big.bin") == hashlib.sha256(big).hexdigest()

@@ -7,7 +7,15 @@ from dataclasses import replace
 import pytest
 
 from commons.core.fleet import discover
-from commons.core.group import file_lines, group, is_text, is_text_file
+from commons.core.group import (
+    compare_variants,
+    file_lines,
+    fingerprint,
+    group,
+    is_text,
+    is_text_file,
+    same_content,
+)
 from commons.core.scan import scan_profile
 from tests.fleet import dir_hash_md5, hub_content_hash, skill_md, write_files
 
@@ -579,3 +587,21 @@ def test_excluded_dir_difference_in_one_profile_is_dup(fleet):
     b = {"SKILL.md": _MD}
     root = fleet({"default": {"a/x": a, "b/x": b}})
     assert _groups(root)["x"].status == "in-profile-dup"
+
+
+def test_fingerprint_and_same_content(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    write_files(a, {"SKILL.md": _MD, "n.txt": "x\n"})
+    write_files(b, {"SKILL.md": _MD, "n.txt": "x\n"})
+    assert fingerprint(a) == fingerprint(b) and same_content(a, b)
+    (b / "empty").mkdir()
+    assert fingerprint(a) != fingerprint(b) and not same_content(a, b)
+    plain = fingerprint(a)
+    os.chmod(a / "n.txt", 0o755)
+    assert fingerprint(a) != plain
+
+
+def test_compare_variants(classic_fleet):
+    g = _groups(classic_fleet)["conflict"]
+    stats = compare_variants(g.copies)
+    assert {cid: n for cid, (n, _) in stats.items()} == g.unique_lines

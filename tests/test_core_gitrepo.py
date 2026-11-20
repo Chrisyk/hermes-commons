@@ -434,3 +434,22 @@ def test_four_threads_committing_all_land(repo):
     )
     assert fsck.returncode == 0, fsck.stderr
     assert repo.status_porcelain() == []
+
+
+def test_head_and_changed_since(repo):
+    assert repo.head() is None
+    _write(repo.path / "a" / "x.md", "1\n")
+    _write(repo.path / ".commons" / "lock", "")
+    assert repo.changed_since(None) == ["a/x.md"]
+    first = repo.commit_all("first")
+    assert repo.head() == first
+    assert repo.changed_since(first) == []
+    _write(repo.path / "a" / "x.md", "2\n")
+    _write(repo.path / "b" / "new.md", "n\n")
+    second = repo.commit_paths([repo.path / "a"], "edit a")
+    assert repo.changed_since(first) == ["a/x.md", "b/new.md"]
+    assert repo.changed_since(second) == ["b/new.md"]
+    (repo.path / "a" / "x.md").unlink()
+    assert repo.changed_since(second) == ["a/x.md", "b/new.md"]
+    with pytest.raises(ValueError):
+        repo.changed_since("HEAD")

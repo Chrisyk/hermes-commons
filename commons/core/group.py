@@ -333,6 +333,21 @@ def content_identity(path: Path) -> frozenset[tuple[str, str, bool, str]]:
     return _identity(_content(Path(path)))
 
 
+def fingerprint(path: Path) -> str:
+    """sha256 of content_identity: equal exactly when two trees are 'identical' to grouping."""
+    h = hashlib.sha256()
+    for rel, kind, executable, digest in sorted(content_identity(path)):
+        h.update(
+            os.fsencode(rel)
+            + b"\0"
+            + kind.encode()
+            + (b"x" if executable else b"-")
+            + digest.encode()
+            + b"\0"
+        )
+    return h.hexdigest()
+
+
 def same_content(a: Path, b: Path) -> bool:
     """True when two skill trees are identical as grouping sees them (raw bytes, modes, folders)."""
     return content_identity(a) == content_identity(b)

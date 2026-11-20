@@ -18,7 +18,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
-from commons.core.backup import _file_sha256, tree_sha256
+from commons.core.backup import file_sha256, tree_sha256
 
 RETIRED = "retired"
 _AT_FDCWD = -100
@@ -150,7 +150,7 @@ def _copy_then_remove(src: Path, dest: Path) -> None:
             shutil.copy2(src, staging, follow_symlinks=False)
             _fsync_path(staging)
             _fsync_path(dest.parent)
-            ok = _file_sha256(staging) == _file_sha256(src) and (staging.stat().st_mode == src.stat().st_mode)
+            ok = file_sha256(staging) == file_sha256(src) and (staging.stat().st_mode == src.stat().st_mode)
         if not ok:
             raise OSError(errno.EIO, f"copy of {src} did not verify; source left in place")
         _rename_noreplace(staging, dest)
@@ -177,19 +177,16 @@ def _copy_then_remove(src: Path, dest: Path) -> None:
     _fsync_path(src.parent)
 
 
-def retire(path: Path, backup_dir: Path, profile: str, rel: str) -> Path:
-    """Move path to backup_dir/retired/<profile>/<rel> and return the new location.
+def move_noreplace(src: Path, dest: Path) -> Path:
+    """Move src (folder, symlink or file) to dest, never replacing anything; return dest.
 
-    path may be a skill folder, a symlink or a plain file. Raises
-    FileExistsError if the target exists (nothing is overwritten, not even an
-    empty dir), FileNotFoundError if path is missing, ValueError if profile or
-    rel would escape the backup dir, and RetireError if a cross-filesystem
-    move copied everything but could not finish removing the source.
+    Same guarantees as retire: FileExistsError if dest exists,
+    FileNotFoundError if src is missing, a verified copy before any removal
+    when the move crosses file systems, RetireError if that removal fails.
     """
-    src = Path(path)
-    dest = retired_path(Path(backup_dir), profile, rel)
+    src, dest = Path(src), Path(dest)
     if not _exists(src):
-        raise FileNotFoundError(f"nothing to retire at {src}")
+        raise FileNotFoundError(f"nothing to move at {src}")
     if _exists(dest):
         raise FileExistsError(f"{dest} already exists; refusing to overwrite")
     _mkdirs_durable(dest.parent)
@@ -204,3 +201,19 @@ def retire(path: Path, backup_dir: Path, profile: str, rel: str) -> Path:
     _fsync_path(dest.parent)
     _fsync_path(src.parent)
     return dest
+
+
+def retire(path: Path, backup_dir: Path, profile: str, rel: str) -> Path:
+    """Move path to backup_dir/retired/<profile>/<rel> and return the new location.
+
+    path may be a skill folder, a symlink or a plain file. Raises
+    FileExistsError if the target exists (nothing is overwritten, not even an
+    empty dir), FileNotFoundError if path is missing, ValueError if profile or
+    rel would escape the backup dir, and RetireError if a cross-filesystem
+    move copied everything but could not finish removing the source.
+    """
+    src = Path(path)
+    dest = retired_path(Path(backup_dir), profile, rel)
+    if not _exists(src):
+        raise FileNotFoundError(f"nothing to retire at {src}")
+    return move_noreplace(src, dest)

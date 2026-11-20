@@ -387,6 +387,41 @@ class GitRepo:
                 entries.append((sha, date, subject))
         return entries
 
+    def head(self) -> str | None:
+        """Full sha of HEAD, or None before the first commit. Read-only: no lock taken."""
+        if not self._has_head():
+            return None
+        return self._run("rev-parse", "HEAD", read_only=True).stdout.strip()
+
+    def changed_since(self, sha: str | None) -> list[str]:
+        """Repo-relative POSIX paths changed in the work tree since commit *sha*, sorted.
+
+        Committed and uncommitted edits, deletions and untracked files all
+        count; commons state is left out. sha None means everything in the
+        work tree. Read-only: no lock taken.
+        """
+        if sha is not None and (not isinstance(sha, str) or not _SHA.fullmatch(sha)):
+            raise ValueError(f"bad commit sha {sha!r}: use 7 to 40 lowercase hex digits")
+        if sha is None:
+            listed = self._run("ls-files", "-z", "--", ".", *_EXCLUDE_PATHSPECS, read_only=True).stdout
+        else:
+            full = self._run("rev-parse", "--verify", f"{sha}^{{commit}}", read_only=True).stdout.strip()
+            listed = self._run(
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                full,
+                "--",
+                ".",
+                *_EXCLUDE_PATHSPECS,
+                read_only=True,
+            ).stdout
+        others = self._run(
+            "ls-files", "--others", "--exclude-standard", "-z", "--", ".", *_EXCLUDE_PATHSPECS, read_only=True
+        ).stdout
+        return sorted({p for p in (listed + others).split("\0") if p})
+
     def revert(self, sha: str) -> str:
         """Revert one commit with a new commit and return its sha. Aborts cleanly on conflict.
 

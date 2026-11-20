@@ -108,7 +108,8 @@ def _hash_into(h, path: Path) -> int:
     return total
 
 
-def _file_sha256(path: Path) -> str | None:
+def file_sha256(path: Path) -> str | None:
+    """sha256 of a file's bytes (through a symlink), or None when it does not exist."""
     h = hashlib.sha256()
     try:
         _hash_into(h, path)
@@ -144,7 +145,7 @@ def _copy_file(src: Path, dst: Path) -> None:
     _fsync_path(dst)
 
 
-def _copy_tree(src: Path, dst: Path) -> None:
+def copy_tree(src: Path, dst: Path) -> None:
     """Copy src to a new dir dst, symlinks kept as links; fsync every file, then every dir."""
     dst.mkdir()
     dirs = [dst]
@@ -183,7 +184,7 @@ def _new_backup_dir(root: Path, stamp: str, label: str) -> tuple[str, Path]:
         return bid, target
 
 
-def _write_json_atomic(path: Path, data: dict) -> None:
+def write_json_atomic(path: Path, data: dict) -> None:
     """tmp + fsync + os.replace + fsync of the parent dir."""
     tmp = path.with_name(f".{path.name}.tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -234,7 +235,7 @@ def create_backup(where: Backups, profiles: list[Profile], label: str, now: date
         if skills.is_dir():
             # A symlinked skills dir is followed at the top only (its contents are copied).
             try:
-                _copy_tree(skills, dest / SKILLS)
+                copy_tree(skills, dest / SKILLS)
             except FileNotFoundError as exc:
                 raise BackupError(
                     f"backup {bid}: {profile.name} skills changed while copying ({exc})"
@@ -243,8 +244,8 @@ def create_backup(where: Backups, profiles: list[Profile], label: str, now: date
         copy_hash = tree_sha256(dest / SKILLS)
         if copy_hash != source_hash:
             raise BackupError(f"backup {bid}: {profile.name} skills changed while copying")
-        config_hash = _file_sha256(config) if config.is_file() else None
-        if config_hash != _file_sha256(dest / CONFIG_FILE):
+        config_hash = file_sha256(config) if config.is_file() else None
+        if config_hash != file_sha256(dest / CONFIG_FILE):
             raise BackupError(f"backup {bid}: {profile.name} config.yaml changed while copying")
         config_link = _link_target(config)
         skills_link = _link_target(skills)
@@ -261,7 +262,7 @@ def create_backup(where: Backups, profiles: list[Profile], label: str, now: date
 
     _fsync_path(target)
     manifest = {"id": bid, "created": now.isoformat(), "label": label, "profiles": entries}
-    _write_json_atomic(target / MANIFEST, manifest)
+    write_json_atomic(target / MANIFEST, manifest)
     return bid
 
 
@@ -294,7 +295,7 @@ def verify_backup(where: Backups, backup_id: str) -> list[str]:
             problems.append(f"{name}: profile folder missing from backup")
             continue
         config = dest / CONFIG_FILE
-        actual_config = _file_sha256(config) if config.is_file() else None
+        actual_config = file_sha256(config) if config.is_file() else None
         if actual_config != entry.get("config_sha256"):
             problems.append(f"{name}: config.yaml does not match manifest")
         if tree_sha256(dest / SKILLS) != entry.get("skills_tree_sha256"):

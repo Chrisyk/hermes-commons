@@ -10,7 +10,7 @@ import pytest
 
 from commons.core import moves
 from commons.core.backup import tree_sha256
-from commons.core.moves import RetireError, retire
+from commons.core.moves import RetireError, move_noreplace, retire
 
 
 def _skill(path: Path, body: str = "body\n") -> Path:
@@ -262,3 +262,24 @@ def test_partial_source_removal_names_path_and_safe_copy(tmp_path, monkeypatch):
     assert f"full copy is safe at {dest}" in message
     assert isinstance(info.value, OSError)
     assert tree_sha256(dest) == before
+
+
+def test_move_noreplace(tmp_path):
+    src = _skill(tmp_path / "a" / "s")
+    before = tree_sha256(src)
+    dest = move_noreplace(src, tmp_path / "b" / "deep" / "s")
+    assert tree_sha256(dest) == before and not src.exists()
+    other = _skill(tmp_path / "c" / "s")
+    with pytest.raises(FileExistsError):
+        move_noreplace(other, dest)
+    assert other.exists()
+    with pytest.raises(FileNotFoundError):
+        move_noreplace(tmp_path / "missing", tmp_path / "x")
+
+
+def test_move_noreplace_across_file_systems(tmp_path, monkeypatch):
+    src = _skill(tmp_path / "a" / "s")
+    before = tree_sha256(src)
+    _cross_device(monkeypatch, src)
+    dest = move_noreplace(src, tmp_path / "b" / "s")
+    assert tree_sha256(dest) == before and not src.exists()
