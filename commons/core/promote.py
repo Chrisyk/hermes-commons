@@ -4,7 +4,9 @@ Both follow journal.operation (lock, backup of the touched profile, write-
 ahead journal), so restore(plan_restore(layout, backup_id)) undoes either:
 
 - promote: the profile copy is retired into the backup (intent 'retire'),
-  so restore puts it back; the copy into the shared root ('shared_copy')
+  so restore puts it back, and so is every pristine bundled or hub copy of
+  the name in a profile that reads the shared root (left in place it would
+  shadow the promoted copy; it is recorded in taken_over, see proposal.py); the copy into the shared root ('shared_copy')
   is moved aside into the pre-restore backup when it is unchanged, and
   restore commits that (git history keeps the promoted version).
 - demote: the copy written into the profile is journaled as 'profile_copy'
@@ -31,7 +33,7 @@ from commons.core.gitrepo import GitRepo
 from commons.core.group import TAKEN_OVER_KINDS, fingerprint, is_movable, same_content
 from commons.core.journal import operation, read_commons_config
 from commons.core.layout import Layout
-from commons.core.proposal import RESERVED_TOP, SHARED
+from commons.core.proposal import RESERVED_TOP, SHARED, is_pinned_profile_copy
 from commons.core.resolve import ScanCache, config_path, resolve
 from commons.core.scan import SkillCopy, scan_profile, scan_root
 
@@ -77,6 +79,10 @@ def _shared_copies(layout: Layout) -> list[SkillCopy]:
 def _overlaps(a: str, b: str) -> bool:
     pa, pb = PurePosixPath(a), PurePosixPath(b)
     return pa == pb or pa.is_relative_to(pb) or pb.is_relative_to(pa)
+
+
+def _taken_entry(name: str, profile: str, kind: str, origin_hash: str | None) -> dict:
+    return {"name": name, "profile": profile, "kind": kind, "origin_hash": origin_hash}
 
 
 def promote(
@@ -138,7 +144,14 @@ def _promote(
         if clash or (Path(layout.shared_root) / rel).exists():
             raise PromoteError(f"{name}: {rel} overlaps {', '.join(clash) or 'a folder'} in the shared root")
     target = Path(layout.shared_root) / rel
-    with operation(layout, [source_profile], f"promote-{name}", "promote", now) as op:
+    pinned = [
+        (p, c, fingerprint(c.path))
+        for p in profiles
+        for c in scan_profile(p, md5_dir_hash, hub_hash)
+        if c.name == name and is_pinned_profile_copy(c)
+    ]
+    touched = [source_profile, *dict.fromkeys(p for p, _c, _f in pinned if p.name != from_profile)]
+    with operation(layout, touched, f"promote-{name}", "promote", now) as op:
         sha = None
         if existing is None:
 
@@ -146,25 +159,32 @@ def _promote(
             if not same_content(copy.path, target):
                 raise PromoteError(f"{name}: the copy at {target} does not match {copy.path}")
             sha = op.commit([target], f"promote {name} from {from_profile}", kind="promote")
+        entries = []
         if copy.kind in TAKEN_OVER_KINDS:
-            config = read_commons_config(layout)
-            taken = list(config.get("taken_over", []))
-            entry = {
-                "name": name,
-                "profile": from_profile,
-                "kind": copy.kind,
-                "origin_hash": copy.origin_hash,
-            }
-            if entry not in taken:
-                config["taken_over"] = [*taken, entry]
-                op.write_config(config, f"commons: record take-over of {name}")
+            entries.append(_taken_entry(name, from_profile, copy.kind, copy.origin_hash))
         kept = op.shared_use(name, from_profile, [c.rel for c in mine])
         for c in mine if kept is None else ():
             why = op.retire_profile_copy(name, from_profile, c.rel, before)
             if why is not None:
                 raise PromoteError(f"{name}: {why}; the shared copy is committed, the local one stays")
-        if kept is not None:
-            op.journal.data["problems"] = [kept]
+        pinned_kept = []
+        for p, c, seen in pinned:
+            if not op.reads_shared(p.name):
+                continue
+            why = op.retire_profile_copy(name, p.name, c.rel, seen)
+            if why is None:
+                entries.append(_taken_entry(name, p.name, c.kind, c.origin_hash))
+            else:
+                pinned_kept.append(why)
+        config = read_commons_config(layout)
+        taken = list(config.get("taken_over", []))
+        new = [e for e in entries if e not in taken]
+        if new:
+            config["taken_over"] = [*taken, *new]
+            op.write_config(config, f"commons: record take-over of {name}")
+        problems = ([kept] if kept is not None else []) + pinned_kept
+        if problems:
+            op.journal.data["problems"] = problems
     others = []
     cache = ScanCache()
     shared_root = config_path(Path("/"), Path(layout.shared_root))
@@ -174,7 +194,7 @@ def _promote(
         r = resolve(p, md5_dir_hash, hub_hash, cache=cache).get(name)
         if r is not None and r.winner_path is not None and not r.winner_path.is_relative_to(shared_root):
             others.append(p.name)
-    return PromoteResult(op.backup_id, sha, target, others, [kept] if kept else [])
+    return PromoteResult(op.backup_id, sha, target, others, problems)
 
 
 def demote(

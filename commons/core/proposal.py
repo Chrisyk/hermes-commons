@@ -14,7 +14,18 @@ Rules that are not obvious from the field names:
 - A Move's retire list holds every movable profile copy of the name,
   including the source copy itself: after the copy into the shared root the
   source would otherwise shadow it (the local tier wins in Hermes). Pinned
-  copies (pristine bundled or hub installs) and symlinked copies stay.
+  copies (pristine bundled or hub installs) and symlinked copies stay,
+  except as below.
+- Take-over of pristine copies (design decision 5): when a name gets a move
+  (or a keep choice), every pristine bundled or hub copy of that name in a
+  profile (top level, not through a symlink, not at an old create_dir) is
+  retired too, and recorded in taken_over, so check can report
+  upstream-newer. Left in place it would shadow the shared copy, since the
+  local tier wins. Every profile reads the shared root after setup. A name
+  whose copies are all pristine (no movable copy in any profile or in the
+  shared root) gets no move and stays local; Hermes' sync keeps updating it. A retired bundled
+  copy is not brought back by Hermes' sync: a manifest entry missing on disk
+  counts as deleted by the user (tools/skills_sync.py).
 - A name whose shared copy differs from the copy grouping would keep is a
   conflict, never a move: setup does not overwrite the shared root.
 - Two moves whose targets are equal or nested in each other (or in another
@@ -64,6 +75,9 @@ CREATE_DIR_KEY = "skills.create_dir"
 PLUGINS_KEY = "plugins.enabled"
 RESERVED_TOP = frozenset({".commons", ".git"})
 CREATE_DIR_SUFFIX = ":create_dir"
+PRISTINE_KINDS = frozenset({"bundled-pristine", "hub-pristine"})
+# Kinds recorded in taken_over: edited copies, and pristine ones retired by a move.
+TAKEN_KINDS = frozenset({"bundled-edited", "hub-edited"}) | PRISTINE_KINDS
 
 
 @dataclass
@@ -102,6 +116,7 @@ class Conflict:
     action: str = "merge"
     copies: list[CopyRef] = field(default_factory=list)  # every movable profile copy
     shared_rel: str | None = None  # the shared root's copy, if any
+    pinned: list[CopyRef] = field(default_factory=list)  # pristine profile copies, retired on a move
 
 
 @dataclass
@@ -197,6 +212,7 @@ class Proposal:
                     c["action"],
                     [CopyRef(**r) for r in c["copies"]],
                     c["shared_rel"],
+                    [CopyRef(**r) for r in c.get("pinned", [])],
                 )
                 for c in d["conflicts"]
             ],
@@ -250,11 +266,23 @@ def _overlaps(a: str, b: str) -> bool:
 
 
 def _taken(copies: Iterable[SkillCopy | CopyRef], name: str) -> list[TakenOver]:
-    return [
-        TakenOver(name, c.profile, c.kind, c.origin_hash)
-        for c in copies
-        if c.kind in ("bundled-edited", "hub-edited")
-    ]
+    return [TakenOver(name, c.profile, c.kind, c.origin_hash) for c in copies if c.kind in TAKEN_KINDS]
+
+
+def is_pinned_profile_copy(c: SkillCopy) -> bool:
+    """A pristine bundled or hub copy in a profile's own skills dir that a move retires (see docstring)."""
+    return (
+        c.kind in PRISTINE_KINDS
+        and not c.via_symlink
+        and c.parent_rel is None
+        and c.error is None
+        and c.profile != SHARED
+        and not is_create_dir_label(c.profile)
+    )
+
+
+def _by_profile(copies: Iterable[SkillCopy | CopyRef]) -> list:
+    return sorted(copies, key=lambda c: (profile_order(c.profile), c.rel))
 
 
 def _variants(g: Group, survivors: list[SkillCopy]) -> list[Variant]:
@@ -425,7 +453,12 @@ def build_proposal(
             unmoved += [(status, c) for c in at_create_dir]
             continue
         refs = [CopyRef(c.profile, c.rel, c.kind, c.origin_hash, fingerprint(c.path)) for c in local]
-        prints = {f"{c.profile}:{c.rel}": r.fingerprint for c, r in zip(local, refs, strict=True)}
+        pinned = [c for c in g.copies if is_pinned_profile_copy(c)]
+        pinned_refs = [CopyRef(c.profile, c.rel, c.kind, c.origin_hash, fingerprint(c.path)) for c in pinned]
+        prints = {
+            f"{c.profile}:{c.rel}": r.fingerprint
+            for c, r in zip([*local, *pinned], [*refs, *pinned_refs], strict=True)
+        }
         if shared:
             prints[f"{SHARED}:{shared[0].rel}"] = fingerprint(shared[0].path)
         shared_rel = shared[0].rel if shared else None
@@ -434,11 +467,17 @@ def build_proposal(
             assert keep is not None
             if keep.profile != SHARED and shared and not same_content(keep.path, shared[0].path):
                 prop.conflicts.append(
-                    Conflict(g.name, _variants(g, [keep, shared[0]]), copies=refs, shared_rel=shared_rel)
+                    Conflict(
+                        g.name,
+                        _variants(g, [keep, shared[0]]),
+                        copies=refs,
+                        shared_rel=shared_rel,
+                        pinned=pinned_refs,
+                    )
                 )
                 unmoved += [("conflict", c) for c in at_create_dir]
                 continue
-            retire = _retire_list(local)
+            retire = _retire_list(_by_profile([*local, *pinned]))
             if shared:
                 if not retire:
                     prop.left_in_place += [c.id for c in at_create_dir]
@@ -450,7 +489,9 @@ def build_proposal(
             continue
         # conflict
         survivors = [c for c in g.copies if c.id in g.unique_lines]
-        prop.conflicts.append(Conflict(g.name, _variants(g, survivors), copies=refs, shared_rel=shared_rel))
+        prop.conflicts.append(
+            Conflict(g.name, _variants(g, survivors), copies=refs, shared_rel=shared_rel, pinned=pinned_refs)
+        )
         unmoved += [("conflict", c) for c in at_create_dir]
 
     for g, move, status in pending:
@@ -469,7 +510,8 @@ def build_proposal(
         else:
             summary.contained += 1
         local = [c for c in g.copies if is_movable(c) and c.profile != SHARED]
-        prop.taken_over += _taken(local, g.name)
+        pinned = [c for c in g.copies if is_pinned_profile_copy(c)]
+        prop.taken_over += _taken(_by_profile([*local, *pinned]), g.name)
 
     for why, c in unmoved:
         owner = c.profile.removesuffix(CREATE_DIR_SUFFIX)
@@ -583,7 +625,8 @@ def apply_choice(prop: Proposal, choice: str) -> Proposal:
 
     keep:P turns conflict S into a Move keeping profile P's variant
     ('shared' keeps the shared root's copy) and retiring every movable
-    profile copy of S. merge keeps S a conflict (also undoing an earlier keep
+    profile copy of S, and every pristine profile copy of S (see the
+    module docstring). merge keeps S a conflict (also undoing an earlier keep
     is not supported: rebuild the proposal). Raises ValueError for an
     unknown name, an unknown profile, a malformed choice, keep:P where the
     shared root already holds a different copy of S, or a target that
@@ -607,8 +650,8 @@ def apply_choice(prop: Proposal, choice: str) -> Proposal:
     if variant is None:
         known = ", ".join(v.profile for v in conflict.variants)
         raise ValueError(f"{name}: no variant from profile {who!r} (variants: {known})")
-    retire = _retire_list(conflict.copies, out)
-    prints = {f"{c.profile}:{c.rel}": c.fingerprint for c in conflict.copies}
+    retire = _retire_list(_by_profile([*conflict.copies, *conflict.pinned]), out)
+    prints = {f"{c.profile}:{c.rel}": c.fingerprint for c in [*conflict.copies, *conflict.pinned]}
     if who == SHARED:
         shared_dir = Path(out.shared_root) / variant.rel
         move = Move(
@@ -631,7 +674,7 @@ def apply_choice(prop: Proposal, choice: str) -> Proposal:
     out.left_in_place += [f"{c.profile}:{c.rel}" for c in conflict.copies if is_create_dir_label(c.profile)]
     out.moves.append(move)
     out.moves.sort(key=lambda m: m.name)
-    out.taken_over += _taken(conflict.copies, name)
+    out.taken_over += _taken(_by_profile([*conflict.copies, *conflict.pinned]), name)
     out.taken_over.sort(key=lambda t: (t.name, profile_order(t.profile)))
     _recount(out)
     return out

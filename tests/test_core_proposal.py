@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -109,8 +110,11 @@ def test_keep_on_bundled_edited_records_take_over(classic_fleet):
     q = apply_choice(_propose(classic_fleet), "bundled-edited=keep:pocket")
     m = _moves(q)["bundled-edited"]
     assert m.source_profile == "pocket"
-    assert m.retire == [("pikvm", "bundled/bundled-edited"), ("pocket", "bundled/bundled-edited")]
+    # default and device hold the pristine bundled copy: taken over too, so it cannot shadow (decision 5).
+    assert m.retire == [(p, "bundled/bundled-edited") for p in PROFILES]
     assert {(t.name, t.profile, t.kind) for t in q.taken_over} == {
+        ("bundled-edited", "default", "bundled-pristine"),
+        ("bundled-edited", "device", "bundled-pristine"),
         ("bundled-edited", "pikvm", "bundled-edited"),
         ("bundled-edited", "pocket", "bundled-edited"),
     }
@@ -250,3 +254,65 @@ def test_proposal_reads_nothing_it_should_not_write(classic_fleet):
     assert before == after
     assert not (classic_fleet / "shared").exists()
     assert not (classic_fleet / "commons").exists()
+
+
+# ------------------------------------------------------------------ pristine copies of a taken-over name
+
+
+def _mixed_spec(edited_in=("pikvm", "pocket"), hub=False):
+    """classic_fleet's bundled-edited, edited identically (a move) in *edited_in*, pristine elsewhere."""
+    origin = {"SKILL.md": skill_md("b", "Bundled.", ["o1", "o2"])}
+    edited = {"SKILL.md": skill_md("b", "Bundled.", ["o1", "o2", "edit"])}
+    spec = {p: {"x/b": dict(edited if p in edited_in else origin)} for p in PROFILES}
+    if hub:
+        spec["_hub"] = {p: {"b": "x/b"} for p in PROFILES}
+    else:
+        spec["_bundled"] = {p: {"b": origin} for p in PROFILES}
+    return spec
+
+
+def _hub_pristine_locks(root, edited_in):
+    """Make each non-edited profile's hub lock record its own (pristine) copy's hash."""
+    for p in PROFILES:
+        skills = profile_home(root, p) / "skills"
+        lock = json.loads((skills / ".hub" / "lock.json").read_text())
+        if p not in edited_in:
+            lock["installed"]["b"]["content_hash"] = hub_content_hash(skills / "x" / "b")
+        else:
+            lock["installed"]["b"]["content_hash"] = "sha256:old"
+        (skills / ".hub" / "lock.json").write_text(json.dumps(lock))
+
+
+@pytest.mark.parametrize("hub", [False, True])
+def test_move_retires_pristine_copies_of_the_same_name(fleet, hub):
+    root = fleet(_mixed_spec(hub=hub))
+    if hub:
+        _hub_pristine_locks(root, ("pikvm", "pocket"))
+    p = _propose(root)
+    m = _moves(p)["b"]
+    assert m.source_profile in ("pikvm", "pocket")
+    assert m.retire == [(prof, "x/b") for prof in PROFILES]
+    pristine = "hub-pristine" if hub else "bundled-pristine"
+    edited = "hub-edited" if hub else "bundled-edited"
+    assert {(t.profile, t.kind) for t in p.taken_over} == {
+        ("default", pristine),
+        ("device", pristine),
+        ("pikvm", edited),
+        ("pocket", edited),
+    }
+    assert p.stays_local == []
+
+
+def test_only_pristine_copies_still_stay_local(fleet):
+    root = fleet(_mixed_spec(edited_in=()))
+    p = _propose(root)
+    assert p.moves == [] and p.conflicts == [] and p.taken_over == []
+    assert p.stays_local == ["b"]
+
+
+def test_conflict_keeps_its_pristine_copies_for_the_keep_choice(classic_fleet):
+    p = _propose(classic_fleet)
+    (c,) = [c for c in p.conflicts if c.name == "bundled-edited"]
+    assert {r.profile for r in c.pinned} == {"default", "device"}
+    assert all(r.kind == "bundled-pristine" and r.fingerprint for r in c.pinned)
+    assert Proposal.from_json(p.to_json()) == p

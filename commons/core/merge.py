@@ -26,7 +26,11 @@ deletes: a shared copy already at the target is retired into the backup
 first, and each profile copy is retired only if its group.fingerprint still
 equals the one recorded when the task was created; a changed copy is kept
 and reported. Copies at an old skills.create_dir are never retired (they are
-not commons' folder, see proposal.py). Stdlib + PyYAML only.
+not commons' folder, see proposal.py). The pristine bundled or hub profile
+copies of the name (Conflict.pinned, MergeTask.pinned) are not variants;
+accept retires them the same way, since left in place they would shadow
+the merged copy, and records them and every retired edited copy in
+.commons/config.json taken_over, so check can report upstream-newer. Stdlib + PyYAML only.
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ from commons.core.gitrepo import GitRepo
 from commons.core.group import compare_variants, file_views, fingerprint, profile_order
 from commons.core.journal import operation, profiles_from_homes, read_commons_config
 from commons.core.layout import Layout, check_id
-from commons.core.proposal import SHARED, Conflict, Proposal, is_create_dir_label
+from commons.core.proposal import SHARED, TAKEN_KINDS, Conflict, Proposal, is_create_dir_label
 from commons.core.scan import SKILL_FILE, SkillCopy, read_skill_name
 
 TASKS_DIR = ".tasks"
@@ -81,6 +85,19 @@ class MergeVariant:
     unique_files: list[str] = field(default_factory=list)
     fingerprint: str = ""  # group.fingerprint when the task was created
     retire: bool = True  # False for the shared copy and old create_dir copies
+    kind: str = "own"  # scan kind of the copy (bundled-edited / hub-edited are taken over)
+    origin_hash: str | None = None
+
+
+@dataclass
+class PinnedCopy:
+    """A pristine bundled or hub profile copy of the name: not a variant, retired on accept."""
+
+    profile: str
+    rel: str
+    kind: str
+    origin_hash: str | None
+    fingerprint: str
 
 
 @dataclass
@@ -93,6 +110,7 @@ class MergeTask:
     state_dir: Path
     profile_homes: dict[str, Path]
     created: str
+    pinned: list[PinnedCopy] = field(default_factory=list)
 
     @property
     def layout(self) -> Layout:
@@ -120,6 +138,7 @@ class MergeTask:
             state_dir=Path(d["state_dir"]),
             profile_homes={k: Path(v) for k, v in d["profile_homes"].items()},
             created=d["created"],
+            pinned=[PinnedCopy(**c) for c in d.get("pinned", [])],
         )
 
 
@@ -227,6 +246,7 @@ def _target_rel(prop: Proposal, conflict: Conflict) -> str:
 
 def _build_task(layout: Layout, prop: Proposal, conflict: Conflict) -> MergeTask | None:
     places: list[tuple[str, str, Path, bool]] = []
+    kinds = {(c.profile, c.rel): (c.kind, c.origin_hash) for c in conflict.copies}
     for c in conflict.copies:
         places.append(
             (c.profile, c.rel, prop.source_root(c.profile) / c.rel, not is_create_dir_label(c.profile))
@@ -249,9 +269,17 @@ def _build_task(layout: Layout, prop: Proposal, conflict: Conflict) -> MergeTask
     for (label, rel, path, retire), c in zip(live, copies, strict=True):
         size, mtime = _size_mtime(path)
         lines, files = stats[c.id]
+        kind, origin = kinds.get((label, rel), ("own", None))
         variants.append(
-            MergeVariant(label, rel, path, size, _stamp(mtime), lines, files, fingerprint(path), retire)
+            MergeVariant(
+                label, rel, path, size, _stamp(mtime), lines, files, fingerprint(path), retire, kind, origin
+            )
         )
+    pinned = [
+        PinnedCopy(c.profile, c.rel, c.kind, c.origin_hash, c.fingerprint)
+        for c in conflict.pinned
+        if c.profile in prop.profile_homes and _exists(prop.source_root(c.profile) / c.rel)
+    ]
     return MergeTask(
         name=conflict.name,
         target_rel=_target_rel(prop, conflict),
@@ -261,6 +289,7 @@ def _build_task(layout: Layout, prop: Proposal, conflict: Conflict) -> MergeTask
         state_dir=Path(layout.state_dir),
         profile_homes=dict(prop.profile_homes),
         created=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        pinned=pinned,
     )
 
 
@@ -536,21 +565,41 @@ def accept(
             op.place(task.name, Path(task.staging), target)
             sha = op.commit([target], f"merge {task.name}", kind="merge")
             kept = []
+            taken: list[dict[str, Any]] = []
             for v in task.variants:
                 if v.retire and v.profile in op.profiles:
                     why = op.retire_profile_copy(task.name, v.profile, v.rel, v.fingerprint)
                     if why is not None:
                         kept.append(why)
+                    elif v.kind in TAKEN_KINDS:
+                        taken.append(_taken_entry(task.name, v.profile, v.kind, v.origin_hash))
+            for c in task.pinned:
+                if c.profile in op.profiles and op.reads_shared(c.profile):
+                    why = op.retire_profile_copy(task.name, c.profile, c.rel, c.fingerprint)
+                    if why is not None:
+                        kept.append(why)
+                    else:
+                        taken.append(_taken_entry(task.name, c.profile, c.kind, c.origin_hash))
             layout = task.layout
             config = read_commons_config(layout)
             _set_names(config, RESOLVED, add=[task.name])
             _set_names(config, SKIPPED, drop=[task.name])
+            recorded = list(config.get("taken_over", []))
+            config["taken_over"] = recorded + [t for t in taken if t not in recorded]
             op.write_config(config, f"commons: mark {task.name} resolved")
             task_file = _task_path(layout, task.name)
             if task_file.exists():
                 op.move_task_file(task_file, op.backup_dir / "merge-task.json")
             op.journal.data["problems"] = kept
             return AcceptResult(op.backup_id, sha, kept, list(op.done))
+
+
+def _taken_entry(name: str, profile: str, kind: str, origin_hash: str | None) -> dict[str, Any]:
+    return {"name": name, "profile": profile, "kind": kind, "origin_hash": origin_hash}
+
+
+def _exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
 
 
 def skip(layout: Layout, name: str, now: datetime | None = None) -> str:

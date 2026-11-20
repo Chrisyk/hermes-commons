@@ -158,6 +158,14 @@ class Operation:
             self.journal.save()
         return sha
 
+    def reads_shared(self, profile: str) -> bool:
+        """True when *profile*'s config.yaml (as it is now) has the shared root as its create_dir tier."""
+        current = self.profiles[profile]
+        p = Profile(current.name, current.home, load_config(Path(current.home) / CONFIG_FILE))
+        shared = config_path(Path("/"), Path(self.layout.shared_root))
+        index = build_index(p, _no_hash, _no_hash)
+        return any(r.tier == TIER_CREATE_DIR and r.path == shared for r in index.roots)
+
     def shared_use(self, name: str, profile: str, rels: Sequence[str]) -> str | None:
         """None when *profile* loads *name* from the shared root once *rels* are retired; else why not.
 
