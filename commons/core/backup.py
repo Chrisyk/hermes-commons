@@ -1,4 +1,10 @@
-"""Profile backups under <shared_root>/.commons/backups/<id>/<profile>/.
+"""Profile backups under <backups dir>/<id>/<profile>/.
+
+The backups dir is Layout.backups_dir (<state dir>/backups), which must lie
+outside every skills root: Hermes indexes any SKILL.md under a skills root,
+dot-dirs included, so a backup inside one would become a live skill. Every
+entry point takes a Layout (checked with Layout.check) or a plain backups
+dir (checked against the profiles' skills roots when creating).
 
 A backup holds each profile's config.yaml (if present) and its whole skills/
 dir, copied with symlinks kept as symlinks (never followed out of the tree),
@@ -19,14 +25,12 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
 from commons.core.fleet import CONFIG_FILE, Profile
+from commons.core.layout import Layout, check_id, check_outside, skill_roots
 
-STATE_DIR = ".commons"
-BACKUPS_DIR = "backups"
 MANIFEST = "manifest.json"
 SKILLS = "skills"
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -37,20 +41,19 @@ class BackupError(RuntimeError):
     pass
 
 
-def backups_root(shared_root: Path) -> Path:
-    return Path(shared_root) / STATE_DIR / BACKUPS_DIR
+Backups = Path | Layout
 
 
-def _is_excluded(path: Path, exclude: Iterable[Path]) -> bool:
-    return any(path == e for e in exclude)
+def backups_root(where: Backups) -> Path:
+    """The backups dir of a Layout, or *where* itself when it is a path."""
+    return where.backups_dir if isinstance(where, Layout) else Path(where)
 
 
-def _walk(root: Path, exclude: tuple[Path, ...] = ()) -> list[tuple[str, Path]]:
+def _walk(root: Path) -> list[tuple[str, Path]]:
     """Every entry under root as (posix relpath, path), sorted, never following symlinks."""
     found: list[tuple[str, Path]] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         here = Path(dirpath)
-        dirnames[:] = [d for d in dirnames if not _is_excluded((here / d).resolve(), exclude)]
         for name in dirnames + filenames:
             p = here / name
             found.append((p.relative_to(root).as_posix(), p))
@@ -58,19 +61,20 @@ def _walk(root: Path, exclude: tuple[Path, ...] = ()) -> list[tuple[str, Path]]:
     return found
 
 
-def tree_sha256(root: Path, exclude: tuple[Path, ...] = ()) -> str | None:
+def tree_sha256(root: Path) -> str | None:
     """Deterministic sha256 over (relpath, type, bytes or link target, exec bit); None if root is absent.
 
     Directories are included so empty folders count. Symlinks hash their target
-    text and are never followed. exclude lists resolved directory paths to skip.
+    text and are never followed. Names are hashed as their raw bytes
+    (os.fsencode), so a non-UTF-8 file name never raises.
     """
     root = Path(root)
     if not root.is_dir():
         return None
     h = hashlib.sha256()
-    for rel, p in _walk(root, exclude):
+    for rel, p in _walk(root):
         st = p.lstat()
-        h.update(rel.encode("utf-8") + b"\x00")
+        h.update(os.fsencode(rel) + b"\x00")
         if stat.S_ISLNK(st.st_mode):
             h.update(b"l\x00" + os.fsencode(os.readlink(p)) + b"\x00")
         elif stat.S_ISDIR(st.st_mode):
@@ -86,12 +90,12 @@ def tree_sha256(root: Path, exclude: tuple[Path, ...] = ()) -> str | None:
     return h.hexdigest()
 
 
-def count_files(root: Path, exclude: tuple[Path, ...] = ()) -> int:
+def count_files(root: Path) -> int:
     """Non-directory entries (files and symlinks, a symlinked folder counts once)."""
     root = Path(root)
     if not root.is_dir():
         return 0
-    return sum(1 for _, p in _walk(root, exclude) if p.is_symlink() or not p.is_dir())
+    return sum(1 for _, p in _walk(root) if p.is_symlink() or not p.is_dir())
 
 
 def _hash_into(h, path: Path) -> int:
@@ -140,11 +144,11 @@ def _copy_file(src: Path, dst: Path) -> None:
     _fsync_path(dst)
 
 
-def _copy_tree(src: Path, dst: Path, exclude: tuple[Path, ...]) -> None:
+def _copy_tree(src: Path, dst: Path) -> None:
     """Copy src to a new dir dst, symlinks kept as links; fsync every file, then every dir."""
     dst.mkdir()
     dirs = [dst]
-    for rel, p in _walk(src, exclude):
+    for rel, p in _walk(src):
         target = dst / rel
         st = p.lstat()
         if stat.S_ISLNK(st.st_mode):
@@ -194,8 +198,11 @@ def _link_target(path: Path) -> str | None:
     return os.readlink(path) if path.is_symlink() else None
 
 
-def create_backup(shared_root: Path, profiles: list[Profile], label: str, now: datetime | None = None) -> str:
+def create_backup(where: Backups, profiles: list[Profile], label: str, now: datetime | None = None) -> str:
     """Snapshot every profile and return the backup id '<UTC %Y%m%dT%H%M%SZ>-<label>[-N]'.
+
+    *where* is a Layout (Layout.check runs first) or a backups dir, which
+    must not overlap any skills root of *profiles* (ValueError otherwise).
 
     The copy is hashed against the source; any mismatch (for example a skill
     edited mid-copy) raises BackupError and leaves the partial backup without
@@ -208,10 +215,11 @@ def create_backup(shared_root: Path, profiles: list[Profile], label: str, now: d
         raise ValueError(f"duplicate profile names in {names}")
     now = now or datetime.now(UTC)
     now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
-    root = backups_root(shared_root)
+    if isinstance(where, Layout):
+        where.check(profiles)
+    root = backups_root(where)
+    check_outside(root, "the backups dir", skill_roots(profiles))
     bid, target = _new_backup_dir(root, now.strftime("%Y%m%dT%H%M%SZ"), label)
-    # If the shared root sits inside a skills dir, never copy its state folder.
-    exclude = ((Path(shared_root) / STATE_DIR).resolve(),)
 
     entries: dict[str, dict] = {}
     for profile in profiles:
@@ -222,11 +230,11 @@ def create_backup(shared_root: Path, profiles: list[Profile], label: str, now: d
             shutil.copy2(config, dest / CONFIG_FILE, follow_symlinks=True)
             _fsync_path(dest / CONFIG_FILE)
         skills = profile.skills_dir
-        source_hash = tree_sha256(skills, exclude)
+        source_hash = tree_sha256(skills)
         if skills.is_dir():
             # A symlinked skills dir is followed at the top only (its contents are copied).
             try:
-                _copy_tree(skills, dest / SKILLS, exclude)
+                _copy_tree(skills, dest / SKILLS)
             except FileNotFoundError as exc:
                 raise BackupError(
                     f"backup {bid}: {profile.name} skills changed while copying ({exc})"
@@ -257,9 +265,9 @@ def create_backup(shared_root: Path, profiles: list[Profile], label: str, now: d
     return bid
 
 
-def list_backups(shared_root: Path) -> list[str]:
+def list_backups(where: Backups) -> list[str]:
     """Ids of complete backups (those with a manifest), sorted oldest first."""
-    root = backups_root(shared_root)
+    root = backups_root(where)
     try:
         dirs = [d for d in root.iterdir() if d.is_dir() and (d / MANIFEST).is_file()]
     except FileNotFoundError:
@@ -267,19 +275,18 @@ def list_backups(shared_root: Path) -> list[str]:
     return sorted(d.name for d in dirs)
 
 
-def load_manifest(shared_root: Path, backup_id: str) -> dict:
-    if "/" in backup_id or backup_id in ("", ".", ".."):
-        raise ValueError(f"bad backup id {backup_id!r}")
-    return json.loads((backups_root(shared_root) / backup_id / MANIFEST).read_text(encoding="utf-8"))
+def load_manifest(where: Backups, backup_id: str) -> dict:
+    path = backups_root(where) / check_id(backup_id) / MANIFEST
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def verify_backup(shared_root: Path, backup_id: str) -> list[str]:
+def verify_backup(where: Backups, backup_id: str) -> list[str]:
     """Recompute the backup copy's hashes against its manifest; return problems (empty = clean)."""
     try:
-        manifest = load_manifest(shared_root, backup_id)
+        manifest = load_manifest(where, backup_id)
     except (OSError, ValueError) as exc:
         return [f"{backup_id}: cannot read manifest ({exc})"]
-    base = backups_root(shared_root) / backup_id
+    base = backups_root(where) / backup_id
     problems: list[str] = []
     for name, entry in sorted(manifest.get("profiles", {}).items()):
         dest = base / name
