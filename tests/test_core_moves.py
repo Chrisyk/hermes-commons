@@ -283,3 +283,19 @@ def test_move_noreplace_across_file_systems(tmp_path, monkeypatch):
     _cross_device(monkeypatch, src)
     dest = move_noreplace(src, tmp_path / "b" / "s")
     assert tree_sha256(dest) == before and not src.exists()
+
+
+def test_copy_noreplace_cleans_staging_on_interrupt(tmp_path, monkeypatch):
+    src = _skill(tmp_path / "src" / "s")
+    dest = tmp_path / "dest" / "s"
+
+    def interrupted(*_args, **_kwargs):
+        moves.copy_staging(dest).mkdir(parents=True)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(moves, "copy_tree", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        moves.copy_noreplace(src, dest)
+    assert not moves.copy_staging(dest).exists()
+    assert not dest.exists()
+    assert (src / "SKILL.md").is_file()

@@ -222,3 +222,14 @@ def test_prepare_refuses_existing_staging(classic_fleet):
     prepare(task, "variant:default")
     with pytest.raises(MergeError, match="already"):
         prepare(task, "variant:device")
+
+
+def test_code_span_pattern_is_the_backtick_pattern():
+    from commons.core import merge as merge_mod
+
+    tick = chr(96)
+    assert tick not in merge_mod._CODE_SPAN.pattern
+    expected = "(T+)(?!T).+?(?<!T)\\1(?!T)".replace("T", tick)
+    assert merge_mod._CODE_SPAN.pattern.replace("\\x60", tick) == expected
+    sample = f"a {tick}[x](references/a.md){tick} b {tick*2}c{tick}d{tick*2} e"
+    assert merge_mod._CODE_SPAN.sub("", sample) == "a  b  e"

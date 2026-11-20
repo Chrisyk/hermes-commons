@@ -230,7 +230,8 @@ def copy_noreplace(src: Path, dest: Path) -> Path:
         _fsync_path(dest.parent)
         if tree_sha256(staging) != tree_sha256(src):
             raise OSError(errno.EIO, f"copy of {src} did not verify; {dest} not written")
-    except Exception:
+    except BaseException:
+        # KeyboardInterrupt and SystemExit too: a left staging dir blocks the next copy.
         if _exists(staging):
             _remove(staging)
         raise
