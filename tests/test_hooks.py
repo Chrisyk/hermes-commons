@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
+import sys
 import threading
+import types
+from pathlib import Path
 
 import pytest
+import yaml
 
 from commons import hermes_adapter as ha
 from commons import hooks
 from commons.core.fleet import discover
 from commons.core.gitrepo import GitError, GitRepo
+from commons.core.journal import operation
 from commons.core.layout import Layout
 from tests.fleet import dir_hash_md5, hub_content_hash, skill_md, write_files
 
@@ -191,3 +197,172 @@ def test_session_start_ignores_intentional_overrides(wired, caplog):
         hooks.on_session_start(session_id="s")
         assert wired["worker"].flush(10)
     assert not any("shadow" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------------------------ profile context
+
+
+def test_worker_runs_each_job_in_the_callers_context():
+    var = contextvars.ContextVar("v", default="process")
+    seen = []
+    w = hooks.Worker()
+    token = var.set("caller")
+    try:
+        w.submit(lambda: seen.append(var.get()))
+    finally:
+        var.reset(token)
+    w.submit(lambda: seen.append(var.get()))
+    assert w.flush(10)
+    assert seen == ["caller", "process"]
+
+
+def _fake_module(monkeypatch, dotted, **attrs):
+    parts = dotted.split(".")
+    for i in range(1, len(parts)):
+        parent = ".".join(parts[:i])
+        if parent not in sys.modules:
+            monkeypatch.setitem(sys.modules, parent, types.ModuleType(parent))
+    mod = types.ModuleType(dotted)
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    monkeypatch.setitem(sys.modules, dotted, mod)
+    return mod
+
+
+@pytest.fixture
+def hermes_like(tmp_path, monkeypatch):
+    """Fake Hermes modules that keep the active home in a ContextVar, as hermes_constants does.
+
+    Mirrors the public mechanism of Hermes v0.23: set_hermes_home_override
+    pushes the home into hermes_scope's ContextVar state (gateway/run.py binds
+    it per turn), get_hermes_home reads it, profile_name_for_home maps a home
+    to its profile id, and tools.skills_tool searches the active home's skills
+    dir and its skills.create_dir. Nothing in hermes_adapter is patched.
+    """
+    root = tmp_path / "h"
+    shared = tmp_path / "shared"
+    (root / "skills").mkdir(parents=True)
+    (root / "config.yaml").write_text("skills: {}\n", encoding="utf-8")  # default: no shared root
+    dev = root / "profiles" / "dev"
+    (dev / "skills").mkdir(parents=True)
+    (dev / "config.yaml").write_text(f"skills:\n  create_dir: {shared}\n", encoding="utf-8")
+    write_files(shared / "general" / "foo", {"SKILL.md": skill_md("foo", "Foo.", ["one"])})
+    repo = GitRepo(shared)
+    repo.init()
+    repo.commit_all("start")
+    home_var = contextvars.ContextVar("hermes_scope_state", default=None)
+
+    def set_hermes_home_override(path):
+        return home_var.set(None if path is None else str(path))
+
+    def get_hermes_home():
+        return Path(home_var.get() or root)
+
+    def profile_name_for_home(path):
+        p = Path(path)
+        if p == root:
+            return "default"
+        return p.name if p.parent.name == "profiles" else None
+
+    hc = _fake_module(
+        monkeypatch,
+        "hermes_constants",
+        set_hermes_home_override=set_hermes_home_override,
+        reset_hermes_home_override=home_var.reset,
+        get_hermes_home=get_hermes_home,
+        get_default_hermes_root=lambda: root,
+        profile_name_for_home=profile_name_for_home,
+        named_profile_is_deleted=lambda p: False,
+    )
+
+    def skill_search_dirs():
+        home = get_hermes_home()
+        roots = [(1, home / "skills")]
+        cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+        create = (cfg.get("skills") or {}).get("create_dir")
+        if create:
+            roots.append((2, Path(create)))
+        return roots, home / "skills"
+
+    def locate_skill(name, _local, roots):
+        for _tier, d in roots:
+            for md in sorted(Path(d).rglob("SKILL.md")):
+                if md.parent.name == name:
+                    return None, md.parent, md
+        return '{"error": "not found"}', None, None
+
+    _fake_module(
+        monkeypatch,
+        "tools.skills_tool",
+        skill_lookup_path_error=lambda n: None,
+        skill_search_dirs=skill_search_dirs,
+        locate_skill=locate_skill,
+    )
+    monkeypatch.delenv("COMMONS_HERMES_ROOT", raising=False)
+    worker = hooks.Worker()
+    monkeypatch.setattr(hooks, "WORKER", worker)
+    yield {"hc": hc, "root": root, "dev": dev, "shared": shared, "repo": repo, "worker": worker}
+    worker.flush(10)
+
+
+def test_hook_job_sees_the_profile_the_caller_set(hermes_like):
+    hc, shared, repo = hermes_like["hc"], hermes_like["shared"], hermes_like["repo"]
+    _edit(shared, "from dev")
+    seen = {}
+
+    def caller():
+        token = hc.set_hermes_home_override(hermes_like["dev"])
+        try:
+            seen["caller"] = ha.active_profile_name()
+            hooks.on_skill_lifecycle(action="edited", skill_name="foo", session_id="t1")
+        finally:
+            hc.reset_hermes_home_override(token)
+
+    # The turn runs on its own thread, as a gateway turn does; the worker is another thread.
+    t = threading.Thread(target=caller)
+    t.start()
+    t.join(10)
+    assert hermes_like["worker"].flush(10)
+    assert seen["caller"] == "dev"
+    assert ha.active_profile_name() == "default"  # the override never leaked out of the turn
+    assert repo.log(n=1)[0][2] == "edited foo (profile dev, session t1)"
+
+
+def test_hook_job_without_override_uses_the_default_profile(hermes_like):
+    # default has no create_dir, so locate() finds nothing in its roots and nothing is committed.
+    _edit(hermes_like["shared"], "from default")
+    hooks.on_skill_lifecycle(action="edited", skill_name="foo", session_id="t2")
+    assert hermes_like["worker"].flush(10)
+    assert len(hermes_like["repo"].log()) == 1
+
+
+def test_session_start_checks_the_callers_profile(hermes_like, caplog):
+    hc, dev = hermes_like["hc"], hermes_like["dev"]
+    write_files(dev / "skills" / "general" / "foo", {"SKILL.md": skill_md("foo", "Local.", ["l"])})
+    token = hc.set_hermes_home_override(dev)
+    try:
+        with caplog.at_level(logging.WARNING, logger="commons.hooks"):
+            hooks.on_session_start(session_id="s")
+            assert hermes_like["worker"].flush(10)
+    finally:
+        hc.reset_hermes_home_override(token)
+    assert any("profile dev" in r.getMessage() and "foo" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------------------------ unfinished journals
+
+
+def test_hook_does_not_commit_while_a_journal_is_unfinished(wired, caplog):
+    lay = wired["layout"]
+    try:
+        with operation(lay, [], "promote-x", "promote"):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    _edit(wired["shared"], "during an unfinished operation")
+    with caplog.at_level(logging.WARNING, logger="commons.hooks"):
+        hooks.on_skill_lifecycle(action="edited", skill_name="foo", session_id="s")
+        assert wired["worker"].flush(10)
+    assert len(wired["repo"].log()) == 1
+    assert wired["repo"].status_porcelain() != []
+    assert any("did not finish" in r.getMessage() and "not committed" in r.getMessage() for r in caplog.records)

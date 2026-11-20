@@ -10,6 +10,11 @@ the shared root commits just that folder (git timeout 30 s, repo lock 10 s);
 any failure is logged at warning, never raised. A full queue drops the
 event with a warning: the change stays in the work tree and `commons check
 --fix-safe` commits it later. At exit the queue gets a few seconds to drain.
+While any commons journal is unfinished (an interrupted setup or operation,
+see apply.unfinished_setups) the hook commits nothing and logs a warning,
+the same rule check --fix-safe follows. Each job runs in the caller's
+contextvars context (see Worker), so it sees the profile of the turn that
+fired it.
 
 on_session_start (a timeout-bounded hook in Hermes) queues a shadow check
 of the active profile: local copies that hide a shared skill, minus the
@@ -24,6 +29,8 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import contextvars
+import functools
 import json
 import logging
 import os
@@ -34,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from commons import hermes_adapter as ha
+from commons.core.apply import unfinished_setups
 from commons.core.backup import write_json_atomic
 from commons.core.fleet import CONFIG_FILE, Profile
 from commons.core.gitrepo import GitRepo
@@ -50,7 +58,15 @@ EXIT_DRAIN_SECONDS = 5.0
 
 
 class Worker:
-    """One daemon thread draining a bounded queue of callables; errors are logged, never raised."""
+    """One daemon thread draining a bounded queue of callables; errors are logged, never raised.
+
+    Each job runs inside a copy of the submitting thread's contextvars
+    context (contextvars.copy_context at submit time). Hermes keeps the
+    active profile in a ContextVar (hermes_scope state, bound per turn), and
+    a plain Thread does not inherit context, so without the copy the job
+    would see the process default profile: the wrong locate(), commit label
+    and shadow check.
+    """
 
     def __init__(self, maxsize: int = QUEUE_SIZE) -> None:
         self._queue: queue.Queue[Callable[[], Any]] = queue.Queue(maxsize=maxsize)
@@ -75,8 +91,9 @@ class Worker:
 
     def submit(self, job: Callable[[], Any]) -> bool:
         self._ensure_thread()
+        ctx = contextvars.copy_context()
         try:
-            self._queue.put_nowait(job)
+            self._queue.put_nowait(functools.partial(ctx.run, job))
         except queue.Full:
             log.warning("commons hook queue is full; dropped one job (run `hermes commons check --fix-safe`)")
             return False
@@ -135,6 +152,17 @@ def _commit_skill(action: str, name: str, session_id: str) -> None:
     repo = GitRepo(shared)
     if not repo.is_repo():
         log.warning("commons: %s is not a git repo; %s %s not committed", shared, action, name)
+        return
+    left = unfinished_setups(layout)
+    if left:
+        # Same rule as check --fix-safe: half-done changes must not be committed as an edit.
+        log.warning(
+            "commons: operation %s did not finish; %s %s not committed (restore or resume it, then run"
+            " `hermes commons check --fix-safe`)",
+            left[-1],
+            action,
+            name,
+        )
         return
     profile = ha.active_profile_name()
     message = f"{action} {name} (profile {profile}, session {session_id or 'none'})"
