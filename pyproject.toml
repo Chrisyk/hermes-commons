@@ -17,6 +17,9 @@ test = ["pytest>=8", "ruff>=0.6"]
 [tool.setuptools.packages.find]
 include = ["commons*"]
 
+[tool.setuptools.package-data]
+commons = ["skills/*/SKILL.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

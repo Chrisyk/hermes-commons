@@ -10,7 +10,7 @@ SKILL_DESCRIPTION = "Use when editing, sharing or merging skills across profiles
 
 
 def register(ctx) -> None:
-    """Hermes plugin entry point: hooks, `hermes commons`, `/commons` and the commons skill."""
+    """Hermes plugin entry point: hooks, `hermes commons`, `/commons` and the commons skill (a Path)."""
     from commons import cli, hooks
 
     ctx.register_hook("on_skill_lifecycle", hooks.on_skill_lifecycle)
@@ -28,3 +28,4 @@ def register(ctx) -> None:
         description="Shared skill library: status or check (read-only)",
         args_hint="status|check",
     )
+    ctx.register_skill(SKILL_NAME, SKILL_PATH, description=SKILL_DESCRIPTION)
