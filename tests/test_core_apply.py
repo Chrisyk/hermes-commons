@@ -77,7 +77,7 @@ def test_apply_classic_fleet(classic_fleet):
         dest = retired / profile / rel
         assert {f.relative_to(dest): f.read_bytes() for f in dest.rglob("*") if f.is_file()} == files
     journal = load_journal(lay, bid)
-    assert journal["complete"] is True and journal["error"] is None
+    assert journal["complete"] is True and journal["error"] is None and journal["problems"] == []
     assert len(intents(journal, "retire")) == 8
     assert all(i["state"] == "done" for i in intents(journal))
     assert journal["steps"] == [
@@ -89,6 +89,7 @@ def test_apply_classic_fleet(classic_fleet):
         "retire",
         "paths",
         "commons-config",
+        "verify",
     ]
     repo = GitRepo(shared)
     subjects = [s for _, _, s in repo.log()]

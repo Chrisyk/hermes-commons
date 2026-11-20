@@ -26,6 +26,9 @@ it finished):
    retired copy, each file backed up first; commit the markdown rewrites.
 8  commons-config: write shared_root/.commons/config.json (op config_json)
    and commit it.
+9  verify: check the fleet (verify.py) against the names each profile could
+   load before setup; problems go to result.problems and journal
+   'problems' (result.error stays None: setup did finish).
 
 Intent args (all paths absolute strings):
   git_init {path}
@@ -40,7 +43,7 @@ Intent args (all paths absolute strings):
   config_json {path, sha_before}, done adds sha_after
 
 Other journal keys: version, backup_id, created, shared_root, state_dir,
-steps, error, complete, profiles {name: {home, config_before_sha256}},
+steps, error, complete, problems, profiles {name: {home, config_before_sha256}},
 git {initialized, snapshot_sha, base_sha, final_sha}. Stdlib + PyYAML only.
 """
 
@@ -49,8 +52,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -78,6 +81,7 @@ from commons.core.paths import (
     rewrite,
 )
 from commons.core.proposal import CREATE_DIR_KEY, PLUGIN, PLUGINS_KEY, SHARED, Proposal, moved_paths
+from commons.core.verify import resolvable_names, verify
 
 JOURNAL_VERSION = 2
 SNAPSHOT_MESSAGE = "commons: snapshot before setup"
@@ -98,6 +102,7 @@ class ApplyResult:
     error: str | None = None
     rewritten: list[str] = field(default_factory=list)
     not_rewritten: list[str] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)  # verify() after setup; empty = clean
 
 
 class _Journal:
@@ -149,18 +154,34 @@ def _stamp(now: datetime) -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _skill_dir(prop: Proposal, profile: str, rel: str) -> Path:
-    if profile == SHARED:
-        return Path(prop.shared_root) / rel
-    return Path(prop.profile_homes[profile]) / "skills" / rel
+def _skill_dir(prop: Proposal, label: str, rel: str) -> Path:
+    return prop.source_root(label) / rel
+
+
+def _no_hash(_path: Path) -> str:
+    return ""
+
+
+def _check_profiles(proposal: Proposal, profiles: list[Profile]) -> None:
+    """Raise ApplyError unless the fleet is the one the proposal was made for."""
+    by_name = {p.name: p for p in profiles}
+    missing = sorted(set(proposal.profile_homes) - set(by_name))
+    if missing:
+        raise ApplyError(f"profiles named in the proposal are missing: {', '.join(missing)}")
+    extra = sorted(set(by_name) - set(proposal.profile_homes))
+    if extra:
+        raise ApplyError(f"profiles not in the proposal: {', '.join(extra)}; build a new proposal")
+    moved = sorted(n for n, home in proposal.profile_homes.items() if Path(home) != Path(by_name[n].home))
+    if moved:
+        raise ApplyError(f"profile homes differ from the proposal: {', '.join(moved)}; build a new proposal")
 
 
 def _check_fresh(prop: Proposal) -> None:
     """Raise ApplyError when a copy the proposal judged has changed since."""
     for move in prop.moves:
         for key, expected in sorted(move.fingerprints.items()):
-            profile, _, rel = key.partition(":")
-            path = _skill_dir(prop, profile, rel)
+            label, rel = prop.split_key(key)
+            path = _skill_dir(prop, label, rel)
             try:
                 current = fingerprint(path)
             except OSError:
@@ -207,11 +228,15 @@ def apply(
     writer: ConfigWriter,
     now: datetime | None = None,
     home: Path | None = None,
+    md5_dir_hash: Callable[[Path], str] = _no_hash,
+    hub_hash: Callable[[Path], str] = _no_hash,
 ) -> ApplyResult:
     """Carry out *proposal* (see module docstring); a failed step is reported, not raised.
 
-    *profiles* must include every profile the proposal names. *home* anchors
-    ~ paths in cron prompts (default the user's home). Any exception is
+    *profiles* must be exactly the profiles the proposal names, at the same
+    homes. *home* anchors ~ paths in cron prompts (default the user's home).
+    The hash functions only feed provenance in the final verify, which does
+    not change what resolves; they default to a no-op. Any exception is
     recorded in the result and the journal; a BaseException that is not an
     Exception (KeyboardInterrupt, SystemExit) is recorded and then re-raised.
     """
@@ -220,9 +245,7 @@ def apply(
     holder: list[_Journal] = []
     try:
         by_name = {p.name: p for p in profiles}
-        missing = sorted(set(proposal.profile_homes) - set(by_name))
-        if missing:
-            raise ApplyError(f"profiles named in the proposal are missing: {', '.join(missing)}")
+        _check_profiles(proposal, profiles)
         if Path(proposal.shared_root) != Path(layout.shared_root):
             raise ApplyError("the proposal was made for another shared root")
         layout.check(profiles)
@@ -232,9 +255,17 @@ def apply(
             [(f"the skills dir of profile {p.name}", p.skills_dir.resolve()) for p in profiles],
         )
         _check_fresh(proposal)
+        names_before = resolvable_names(profiles, md5_dir_hash, hub_hash)
         repo = GitRepo(layout.shared_root)
         with repo.locked():
             _run(proposal, profiles, by_name, layout, writer, now, home, repo, result, holder)
+            journal = holder[0]
+            after = [replace(p, config=load_config(p.home / CONFIG_FILE)) for p in profiles]
+            overrides = _commons_config_data(layout, proposal, []).get("intentional_overrides", [])
+            result.problems = verify(names_before, after, layout, md5_dir_hash, hub_hash, overrides)
+            journal.data["problems"] = result.problems
+            journal.step("verify")
+            result.steps_done.append("verify")
     except BaseException as exc:
         result.error = f"{type(exc).__name__}: {exc}"
         if holder:
@@ -311,6 +342,7 @@ def _run(
             "steps": [],
             "error": None,
             "complete": False,
+            "problems": [],
             "profiles": {
                 p.name: {
                     "home": str(p.home),

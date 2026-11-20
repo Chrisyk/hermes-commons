@@ -21,12 +21,23 @@ Rules that are not obvious from the field names:
   name's shared copy) cannot both land; the later one by name is 'blocked'.
 - cron_rewrites is a preview from the given jobs; apply recomputes them
   from the jobs.json on disk at apply time with the same rule.
+- A profile whose skills.create_dir points at an existing directory other
+  than the shared root is scanned there too, under the label
+  '<profile>:create_dir' (proposal.roots maps each such label to its
+  folder). Those copies group like profile copies and may be the copy that
+  is moved into the shared root, but they are never retired: the folder is
+  not commons'. They are listed in left_in_place.
+- Every physical skills folder is scanned once: profiles whose skills dirs
+  (or create_dirs) resolve to the same real path are attributed to the
+  first profile in fleet order (default first, then by name); the others
+  are listed in aliases and notes.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path, PurePosixPath
@@ -52,6 +63,7 @@ PLUGIN = "commons"
 CREATE_DIR_KEY = "skills.create_dir"
 PLUGINS_KEY = "plugins.enabled"
 RESERVED_TOP = frozenset({".commons", ".git"})
+CREATE_DIR_SUFFIX = ":create_dir"
 
 
 @dataclass
@@ -143,6 +155,11 @@ class Proposal:
     taken_over: list[TakenOver] = field(default_factory=list)
     summary: Summary = field(default_factory=Summary)
     profile_homes: dict[str, Path] = field(default_factory=dict)
+    roots: dict[str, Path] = field(default_factory=dict)  # '<profile>:create_dir' -> its folder
+    aliases: dict[str, str] = field(default_factory=dict)  # profile -> profile whose skills dir it uses
+    shared_claimed: list[tuple[str, str]] = field(default_factory=list)  # (rel, name) in the shared root
+    left_in_place: list[str] = field(default_factory=list)  # 'label:rel' copies at an old create_dir
+    notes: list[str] = field(default_factory=list)
 
     @property
     def layout(self) -> Layout:
@@ -153,7 +170,8 @@ class Proposal:
         data["shared_root"] = str(self.shared_root)
         data["state_dir"] = str(self.state_dir)
         data["profile_homes"] = {k: str(v) for k, v in self.profile_homes.items()}
-        return json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        data["roots"] = {k: str(v) for k, v in self.roots.items()}
+        return json.dumps(data, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
 
     @classmethod
     def from_json(cls, text: str) -> Proposal:
@@ -194,7 +212,29 @@ class Proposal:
             taken_over=[TakenOver(**t) for t in d["taken_over"]],
             summary=Summary(**{f.name: d["summary"][f.name] for f in fields(Summary)}),
             profile_homes={k: Path(v) for k, v in d["profile_homes"].items()},
+            roots={k: Path(v) for k, v in d.get("roots", {}).items()},
+            aliases=dict(d.get("aliases", {})),
+            shared_claimed=_pairs(d.get("shared_claimed", [])),
+            left_in_place=list(d.get("left_in_place", [])),
+            notes=list(d.get("notes", [])),
         )
+
+    def source_root(self, label: str) -> Path:
+        """The skills folder a copy label stands for: the shared root, a create_dir or a profile's skills dir."""
+        if label == SHARED:
+            return Path(self.shared_root)
+        if label in self.roots:
+            return Path(self.roots[label])
+        return Path(self.profile_homes[label]) / "skills"
+
+    def split_key(self, key: str) -> tuple[str, str]:
+        """Split a fingerprint key 'label:rel' at the longest known label (labels may hold ':')."""
+        labels = sorted([SHARED, *self.profile_homes, *self.roots], key=len, reverse=True)
+        for label in labels:
+            if key.startswith(label + ":"):
+                return label, key[len(label) + 1 :]
+        label, _, rel = key.partition(":")
+        return label, rel
 
 
 def _pairs(items: Iterable) -> list[tuple[str, str]]:
@@ -253,6 +293,69 @@ def _config_changes(profiles: list[Profile], shared_root: Path) -> dict[str, lis
     return out
 
 
+def _real(path: Path) -> Path:
+    try:
+        return Path(os.path.realpath(Path(path).expanduser()))
+    except OSError:
+        return Path(path).expanduser().absolute()
+
+
+def is_create_dir_label(label: str) -> bool:
+    return label.endswith(CREATE_DIR_SUFFIX)
+
+
+def _sources(
+    profiles: list[Profile], shared_root: Path
+) -> tuple[list[tuple[str, Path]], dict[str, Path], dict[str, str], list[str]]:
+    """(label, folder) of every physical skills root to scan once, create_dir roots, aliases, notes."""
+    ordered = sorted(profiles, key=lambda p: profile_order(p.name))
+    shared_real = _real(shared_root)
+    seen: dict[Path, str] = {}
+    sources: list[tuple[str, Path]] = []
+    roots: dict[str, Path] = {}
+    aliases: dict[str, str] = {}
+    notes: list[str] = []
+    for p in ordered:
+        real = _real(p.skills_dir)
+        if real in seen:
+            aliases[p.name] = seen[real]
+            notes.append(f"shared skills dir: {p.name} uses {seen[real]}'s folder")
+            continue
+        seen[real] = p.name
+        sources.append((p.name, p.skills_dir))
+    for p in ordered:
+        create = p.create_dir()
+        if create is None:
+            continue
+        real = config_path(p.home, create)
+        if real == shared_real or real == _real(p.skills_dir) or not real.is_dir():
+            continue
+        if real in seen:
+            if seen[real] != p.name:
+                notes.append(f"{p.name}: skills.create_dir is the folder of {seen[real]}; scanned once")
+            continue
+        overlap = [label for path, label in seen.items() if _overlaps_path(path, real)]
+        if _overlaps_path(shared_real, real):
+            overlap.append(SHARED)
+        if overlap:
+            notes.append(
+                f"{p.name}: skills.create_dir {real} overlaps {', '.join(overlap)}; not scanned separately"
+            )
+            continue
+        label = p.name + CREATE_DIR_SUFFIX
+        seen[real] = label
+        sources.append((label, real))
+        roots[label] = real
+    for p in ordered:
+        if any(config_path(p.home, ext) == shared_real for ext in p.external_dirs()):
+            notes.append(f"{p.name}: skills.external_dirs already lists the shared root (fine)")
+    return sources, roots, aliases, notes
+
+
+def _overlaps_path(a: Path, b: Path) -> bool:
+    return a == b or a.is_relative_to(b) or b.is_relative_to(a)
+
+
 def build_proposal(
     profiles: list[Profile],
     layout: Layout,
@@ -279,21 +382,28 @@ def build_proposal(
         [(f"the skills dir of profile {p.name}", p.skills_dir.resolve()) for p in profiles],
     )
     by_name = {p.name: p for p in profiles}
+    sources, roots, aliases, notes = _sources(profiles, shared_root)
     copies: list[SkillCopy] = []
-    for p in profiles:
-        copies += scan_profile(p, md5_dir_hash, hub_hash)
+    for label, folder in sources:
+        if label in by_name:
+            copies += scan_profile(by_name[label], md5_dir_hash, hub_hash)
+        else:
+            copies += scan_root(folder, label, md5_dir_hash, hub_hash)
     if shared_root.is_dir():
         copies += scan_root(shared_root, SHARED, md5_dir_hash, hub_hash)
     groups = group(copies)
 
     prop = Proposal(shared_root=shared_root, state_dir=Path(layout.state_dir))
     prop.profile_homes = {p.name: p.home for p in profiles}
+    prop.roots, prop.aliases, prop.notes = roots, aliases, notes
     prop.config_changes = _config_changes(profiles, shared_root)
     summary = prop.summary
     summary.names = len(groups)
     # Targets already taken in the shared root, by name.
     claimed: list[tuple[str, str]] = [(c.rel, c.name) for c in copies if c.profile == SHARED]
+    prop.shared_claimed = list(claimed)
     pending: list[tuple[Group, Move, str]] = []
+    unmoved: list[tuple[str, SkillCopy]] = []  # (why, create_dir copy) for names not moved
 
     for g in groups:
         movable = [c for c in g.copies if is_movable(c)]
@@ -304,17 +414,15 @@ def build_proposal(
         if _differs(g, movable):
             summary.differing += 1
         status = g.status
-        if status == "stays-local":
-            prop.stays_local.append(g.name)
-            continue
-        if status == "in-profile-dup":
-            prop.in_profile_dups.append(g.name)
-            continue
-        if status == "unreadable":
-            prop.unreadable.append(g.name)
-            continue
-        if status == "nested":
-            prop.nested.append(g.name)
+        at_create_dir = [c for c in g.copies if is_create_dir_label(c.profile)]
+        if status in ("stays-local", "in-profile-dup", "unreadable", "nested"):
+            {
+                "stays-local": prop.stays_local,
+                "in-profile-dup": prop.in_profile_dups,
+                "unreadable": prop.unreadable,
+                "nested": prop.nested,
+            }[status].append(g.name)
+            unmoved += [(status, c) for c in at_create_dir]
             continue
         refs = [CopyRef(c.profile, c.rel, c.kind, c.origin_hash, fingerprint(c.path)) for c in local]
         prints = {f"{c.profile}:{c.rel}": r.fingerprint for c, r in zip(local, refs, strict=True)}
@@ -328,10 +436,12 @@ def build_proposal(
                 prop.conflicts.append(
                     Conflict(g.name, _variants(g, [keep, shared[0]]), copies=refs, shared_rel=shared_rel)
                 )
+                unmoved += [("conflict", c) for c in at_create_dir]
                 continue
-            retire = [(c.profile, c.rel) for c in local]
+            retire = _retire_list(local)
             if shared:
                 if not retire:
+                    prop.left_in_place += [c.id for c in at_create_dir]
                     continue
                 move = Move(g.name, SHARED, shared[0].rel, shared[0].rel, retire, prints)
             else:
@@ -341,6 +451,7 @@ def build_proposal(
         # conflict
         survivors = [c for c in g.copies if c.id in g.unique_lines]
         prop.conflicts.append(Conflict(g.name, _variants(g, survivors), copies=refs, shared_rel=shared_rel))
+        unmoved += [("conflict", c) for c in at_create_dir]
 
     for g, move, status in pending:
         if move.source_profile != SHARED:
@@ -348,9 +459,11 @@ def build_proposal(
             # Never land a skill in the shared root's own state or git folders.
             if clash or PurePosixPath(move.target_rel).parts[0] in RESERVED_TOP:
                 prop.blocked.append(g.name)
+                unmoved += [("blocked", c) for c in g.copies if is_create_dir_label(c.profile)]
                 continue
             claimed.append((move.target_rel, g.name))
         prop.moves.append(move)
+        prop.left_in_place += [c.id for c in g.copies if is_create_dir_label(c.profile)]
         if status == "identical":
             summary.identical += 1
         else:
@@ -358,23 +471,56 @@ def build_proposal(
         local = [c for c in g.copies if is_movable(c) and c.profile != SHARED]
         prop.taken_over += _taken(local, g.name)
 
+    for why, c in unmoved:
+        owner = c.profile.removesuffix(CREATE_DIR_SUFFIX)
+        prop.notes.append(
+            f"{owner}: {c.name} at its old skills.create_dir ({c.path}) is not moved ({why}); "
+            f"{owner} will not see it after setup unless it is resolved"
+        )
     prop.cron_rewrites = _cron_preview(prop, by_name, cron_jobs, home)
     _recount(prop)
     return prop
 
 
+def _retire_list(
+    copies: Iterable[SkillCopy | CopyRef], prop: Proposal | None = None
+) -> list[tuple[str, str]]:
+    """(profile, rel) of every copy to retire: profile copies only, once per real folder."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for c in copies:
+        if is_create_dir_label(c.profile):
+            continue
+        path = c.path if isinstance(c, SkillCopy) else (prop.source_root(c.profile) / c.rel if prop else None)
+        real = os.path.realpath(path) if path is not None else f"{c.profile}:{c.rel}"
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append((c.profile, c.rel))
+    return out
+
+
 def _source_dir(prop: Proposal, move: Move) -> Path:
     if move.source_profile == SHARED:
         return Path(prop.shared_root) / move.target_rel
-    return Path(prop.profile_homes[move.source_profile]) / "skills" / move.source_rel
+    return prop.source_root(move.source_profile) / move.source_rel
 
 
 def moved_paths(prop: Proposal) -> dict[Path, Path]:
-    """Old profile skill folder -> new shared folder for every retire of every move."""
+    """Old profile skill folder -> new shared folder for every retire of every move.
+
+    A profile whose skills dir is another profile's folder (aliases) gets its
+    own spelling of each retired path too, so prompts naming either are found.
+    """
     out: dict[Path, Path] = {}
+    users: dict[str, list[str]] = {}
+    for alias, owner in prop.aliases.items():
+        users.setdefault(owner, []).append(alias)
     for move in prop.moves:
+        new = Path(prop.shared_root) / move.target_rel
         for profile, rel in move.retire:
-            out[Path(prop.profile_homes[profile]) / "skills" / rel] = Path(prop.shared_root) / move.target_rel
+            for name in [profile, *users.get(profile, [])]:
+                out[Path(prop.profile_homes[name]) / "skills" / rel] = new
     return out
 
 
@@ -415,6 +561,23 @@ def _recount(prop: Proposal) -> None:
 # ------------------------------------------------------------------ choices
 
 
+def check_target(prop: Proposal, name: str, target: str) -> None:
+    """Raise ValueError unless *target* is free for *name*, by the rules build_proposal uses.
+
+    A target may not be in RESERVED_TOP, nor equal to, inside or around a
+    skill of another name in the shared root or another move's target.
+    """
+    parts = PurePosixPath(target).parts
+    if not parts or parts[0] in RESERVED_TOP or ".." in parts or PurePosixPath(target).is_absolute():
+        raise ValueError(f"{name}: target {target} is not a place a skill can land in the shared root")
+    clash = sorted({n for rel, n in prop.shared_claimed if n != name and _overlaps(rel, target)})
+    if clash:
+        raise ValueError(f"{name}: target {target} overlaps {', '.join(clash)} in the shared root")
+    moves = [m.name for m in prop.moves if m.name != name and _overlaps(m.target_rel, target)]
+    if moves:
+        raise ValueError(f"{name}: target {target} overlaps the move of {', '.join(moves)}")
+
+
 def apply_choice(prop: Proposal, choice: str) -> Proposal:
     """Return a copy of *prop* with one choice applied: 'S=keep:P' or 'S=merge'.
 
@@ -422,8 +585,9 @@ def apply_choice(prop: Proposal, choice: str) -> Proposal:
     ('shared' keeps the shared root's copy) and retiring every movable
     profile copy of S. merge keeps S a conflict (also undoing an earlier keep
     is not supported: rebuild the proposal). Raises ValueError for an
-    unknown name, an unknown profile, a malformed choice, or keep:P where the
-    shared root already holds a different copy of S.
+    unknown name, an unknown profile, a malformed choice, keep:P where the
+    shared root already holds a different copy of S, or a target that
+    check_target refuses.
     """
     name, sep, action = choice.partition("=")
     name, action = name.strip(), action.strip()
@@ -443,7 +607,7 @@ def apply_choice(prop: Proposal, choice: str) -> Proposal:
     if variant is None:
         known = ", ".join(v.profile for v in conflict.variants)
         raise ValueError(f"{name}: no variant from profile {who!r} (variants: {known})")
-    retire = [(c.profile, c.rel) for c in conflict.copies]
+    retire = _retire_list(conflict.copies, out)
     prints = {f"{c.profile}:{c.rel}": c.fingerprint for c in conflict.copies}
     if who == SHARED:
         shared_dir = Path(out.shared_root) / variant.rel
@@ -461,11 +625,10 @@ def apply_choice(prop: Proposal, choice: str) -> Proposal:
                 f"{name}: the shared root already has a different copy; choose keep:{SHARED} or merge"
             )
         target = variant.rel
-        clash = [m.name for m in out.moves if _overlaps(m.target_rel, target)]
-        if clash:
-            raise ValueError(f"{name}: target {target} overlaps the move of {', '.join(clash)}")
+        check_target(out, name, target)
         move = Move(name, who, variant.rel, target, retire, prints)
     out.conflicts.remove(conflict)
+    out.left_in_place += [f"{c.profile}:{c.rel}" for c in conflict.copies if is_create_dir_label(c.profile)]
     out.moves.append(move)
     out.moves.sort(key=lambda m: m.name)
     out.taken_over += _taken(conflict.copies, name)
@@ -540,6 +703,9 @@ def render_markdown(p: Proposal) -> str:
         out += ["", "## Bundled or hub skills taken over", ""]
         for t in p.taken_over:
             out.append(f"- {t.name} ({t.profile}, {t.kind}, origin {t.origin_hash or 'unknown'})")
+    if p.notes:
+        out += ["", "## Notes", ""]
+        out += [f"- {n}" for n in p.notes]
     out += ["", "## Left alone", ""]
     for label, names in (
         ("stays local (pristine bundled or hub, or symlinked)", p.stays_local),
@@ -547,6 +713,7 @@ def render_markdown(p: Proposal) -> str:
         ("could not be read", p.unreadable),
         ("nested inside another skill", p.nested),
         ("target clashes with another skill in the shared root", p.blocked),
+        ("left in place at old create_dir", p.left_in_place),
     ):
         out.append(f"- {label}: {', '.join(names) if names else 'none'}")
     out += [
