@@ -1,6 +1,21 @@
+<div align="center">
+
 # commons
 
-One live skill library for every Hermes profile.
+**One live skill library for every Hermes profile.**
+
+[![Version](https://img.shields.io/github/v/tag/Chrisyk/hermes-commons?label=version&style=flat-square)](https://github.com/Chrisyk/hermes-commons/tags)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-0.23%2B-purple?style=flat-square)](https://github.com/NousResearch/hermes-agent)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
+
+[Install](#install) · [What it does](#what-it-does) · [Guild vs commons](#how-it-differs-from-guild) · [Disclosure](#what-it-touches-disclosure)
+
+<img src="docs/assets/demo.gif" alt="commons setup scanning four profiles, printing a merge proposal, applying it with a backup, committing an agent's skill edit to git and catching a shadowed copy with check" width="800">
+
+</div>
+
+---
 
 If you run several Hermes profiles (a coding agent, a home-lab agent, a phone agent), each one
 keeps its own `skills/` folder. Over time the same skill ends up copied into every profile and
@@ -15,6 +30,20 @@ profiles, 42 of them real conflicts, and the skill index took 50 to 60 percent o
 Hermes can already point every profile at one folder (`skills.create_dir`), but nothing helps
 you get there safely, or tells you when a private copy starts hiding the shared one again.
 commons does that part.
+
+<p align="center">
+  <img src="docs/assets/audit.svg" alt="Setup audit of 246 skills: 193 with no differences between copies, 11 where one copy contains the other, 42 real conflicts" width="760">
+</p>
+
+After setup, each profile keeps only the skills that really belong to it, and everything else
+lives once in the shared folder:
+
+<p align="center">
+  <img src="docs/assets/copies.svg" alt="SKILL.md copies per profile before and after setup: server 243 to 46, desktop 167 to 42, pikvm 193 to 39, handheld 228 to 45, plus 199 shared. 831 copies before, 371 after" width="760">
+</p>
+
+The numbers are from my own four profiles on 2026-11-20. `scripts/readme_charts.py` draws the
+charts.
 
 ## What it does
 

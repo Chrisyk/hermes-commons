@@ -1,0 +1,27 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='760' height='290' viewBox='0 0 760 290' font-family='-apple-system,Segoe UI,Helvetica,Arial,sans-serif'>
+<text x='0' y='22' font-size='17' font-weight='600' fill='#8b949e'>SKILL.md copies on disk, per profile</text>
+<text x='100' y='69' font-size='14' text-anchor='end' fill='#8b949e'>server</text>
+<rect x='110' y='50' width='560' height='12' rx='3' fill='#6e7681' opacity='0.55'/>
+<text x='678' y='61' font-size='12' fill='#8b949e'>243 before</text>
+<rect x='110' y='65' width='106' height='12' rx='3' fill='#58a6ff'/>
+<text x='224' y='76' font-size='12' fill='#8b949e'>46 after</text>
+<text x='100' y='113' font-size='14' text-anchor='end' fill='#8b949e'>desktop</text>
+<rect x='110' y='94' width='385' height='12' rx='3' fill='#6e7681' opacity='0.55'/>
+<text x='503' y='105' font-size='12' fill='#8b949e'>167 before</text>
+<rect x='110' y='109' width='97' height='12' rx='3' fill='#58a6ff'/>
+<text x='215' y='120' font-size='12' fill='#8b949e'>42 after</text>
+<text x='100' y='157' font-size='14' text-anchor='end' fill='#8b949e'>pikvm</text>
+<rect x='110' y='138' width='445' height='12' rx='3' fill='#6e7681' opacity='0.55'/>
+<text x='563' y='149' font-size='12' fill='#8b949e'>193 before</text>
+<rect x='110' y='153' width='90' height='12' rx='3' fill='#58a6ff'/>
+<text x='208' y='164' font-size='12' fill='#8b949e'>39 after</text>
+<text x='100' y='201' font-size='14' text-anchor='end' fill='#8b949e'>handheld</text>
+<rect x='110' y='182' width='525' height='12' rx='3' fill='#6e7681' opacity='0.55'/>
+<text x='643' y='193' font-size='12' fill='#8b949e'>228 before</text>
+<rect x='110' y='197' width='104' height='12' rx='3' fill='#58a6ff'/>
+<text x='222' y='208' font-size='12' fill='#8b949e'>45 after</text>
+<text x='100' y='245' font-size='14' text-anchor='end' font-weight='600' fill='#8b949e'>shared</text>
+<rect x='110' y='234' width='459' height='14' rx='3' fill='#a371f7'/>
+<text x='577' y='246' font-size='12' fill='#8b949e'>199 in one folder, read by all four</text>
+<text x='110' y='278' font-size='13' fill='#8b949e'>Total: 831 copies before, 371 after.</text>
+</svg>
