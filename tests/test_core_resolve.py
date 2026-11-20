@@ -14,6 +14,8 @@ from commons.core.resolve import (
     TIER_EXTERNAL,
     TIER_LOCAL,
     TIER_PROJECT,
+    build_index,
+    locate,
     resolve,
     search_roots,
 )
@@ -198,24 +200,138 @@ def test_scan_root_missing_dir(tmp_path):
     assert scan_root(tmp_path / "nope", "x", dir_hash_md5, hub_content_hash) == []
 
 
+def test_folder_name_match_beats_shared_declared_name(tmp_path):
+    shared = tmp_path / "shared"
+    _skill(shared, "s/baz", "foo", ["shared foo"])
+    profile = _profile(tmp_path, create_dir=shared)
+    _skill(profile.skills_dir, "l/foo", "bar", ["local folder foo"])
+    res = _resolve(profile)
+    assert set(res) == {"bar", "foo"}
+    assert res["foo"].winner is not None and res["foo"].winner.rel == "l/foo"
+    assert res["foo"].winner_tier == TIER_LOCAL
+    assert [(t, c.rel) for t, c in res["foo"].shadowed] == [(TIER_CREATE_DIR, "s/baz")]
+    assert res["bar"].winner is not None and res["bar"].winner.rel == "l/foo"
+
+
+def test_folder_and_declared_name_in_one_tier_are_ambiguous(tmp_path):
+    profile = _profile(tmp_path)
+    _skill(profile.skills_dir, "alpha", "beta", ["one"])
+    _skill(profile.skills_dir, "beta", "gamma", ["two"])
+    res = _resolve(profile)["beta"]
+    assert res.winner is None
+    assert sorted(c.rel for c in res.ambiguous) == ["alpha", "beta"]
+
+
+def test_non_string_declared_name_matches_nothing(tmp_path):
+    profile = _profile(tmp_path)
+    _skill(profile.skills_dir, "g/num", "123", ["x"])
+    res = _resolve(profile)
+    assert set(res) == {"123"}
+    assert res["123"].winner is None and res["123"].winner_tier is None
+    assert res["123"].winner_path is None
+
+
+def test_legacy_flat_file_takes_part(tmp_path):
+    shared, ext = tmp_path / "shared", tmp_path / "ext"
+    write_files(shared, {"notes/legacy.md": "legacy flat skill\n"})
+    _skill(ext, "e/legacy", "legacy", ["external"])
+    profile = _profile(tmp_path, create_dir=shared, external=[ext])
+    res = _resolve(profile)["legacy"]
+    assert res.winner is None and res.ambiguous == []
+    assert res.winner_tier == TIER_CREATE_DIR
+    assert res.winner_path == shared / "notes/legacy.md"
+    assert [(t, c.rel) for t, c in res.shadowed] == [(TIER_EXTERNAL, "e/legacy")]
+
+
+def test_nested_root_owns_its_skills(tmp_path):
+    shared = tmp_path / "shared"
+    team = shared / "team"
+    _skill(team, "n/nest", "nest", ["x"])
+    _skill(shared, "both", "both", ["same"])
+    _skill(team, "both", "both", ["same"])
+    profile = _profile(tmp_path, create_dir=shared, external=[team])
+    assert [(r.tier, r.path) for r in search_roots(profile)] == [
+        (TIER_LOCAL, profile.skills_dir),
+        (TIER_CREATE_DIR, shared.resolve()),
+        (TIER_EXTERNAL, team.resolve()),
+    ]
+    res = _resolve(profile)
+    assert res["nest"].winner_tier == TIER_EXTERNAL
+    assert res["both"].winner_tier == TIER_CREATE_DIR
+    assert res["both"].winner is not None and res["both"].winner.path == shared.resolve() / "both"
+    assert [t for t, _ in res["both"].shadowed] == [TIER_EXTERNAL]
+
+
+def test_roots_dedupe_by_raw_path(tmp_path):
+    real = tmp_path / "real-skills"
+    _skill(real, "g/tool", "tool", ["x"])
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "skills").symlink_to(real, target_is_directory=True)
+    profile = Profile("default", home, {"skills": {"create_dir": str(real), "external_dirs": [str(real)]}})
+    assert [(r.tier, r.path) for r in search_roots(profile)] == [(TIER_LOCAL, home / "skills")]
+    assert _resolve(profile)["tool"].winner_tier == TIER_LOCAL
+
+
 _RESOLVE_PROBE = r"""
 import json, sys
 sys.path.insert(0, sys.argv[1])
 import hermes_bootstrap  # noqa: F401
-from tools.skills_tool import locate_skill, skill_search_dirs
+from tools.skills_tool import _resolve_plugin_skill, locate_skill, skill_lookup_path_error, skill_search_dirs
 roots, _ = skill_search_dirs()
 out = {}
 for name in sys.argv[2:]:
-    err, _sd, smd = locate_skill(name, None, roots)
-    out[name] = None if err else str(smd.parent)
+    # The steps skill_view runs before locate_skill.
+    if skill_lookup_path_error(name):
+        out[name] = None
+        continue
+    category = None
+    if ":" in name:
+        served, category = _resolve_plugin_skill(name, None, None, False)
+        if served is not None or (category and skill_lookup_path_error(category)):
+            out[name] = None
+            continue
+    err, _sd, smd = locate_skill(name, category, roots)
+    out[name] = None if err else str(smd)
 print(json.dumps({"roots": [[t, str(d)] for t, d in roots], "found": out}))
 """
 
 
-def test_matches_real_hermes_locate_skill(tmp_path):
+def _hermes_locate(tmp_path, home: Path, names: list[str]) -> dict:
     python, src = _hermes_python(), _hermes_src()
     if python is None or src is None:
         pytest.skip("no Hermes runtime python or Hermes source checkout found")
+    work = tmp_path / "cwd"
+    work.mkdir(exist_ok=True)
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(work), "HERMES_HOME": str(home)}
+    proc = subprocess.run(
+        [str(python), "-I", "-c", _RESOLVE_PROBE, str(src), *names],
+        check=False,
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _assert_matches_hermes(tmp_path, profile: Profile, extra_names=()) -> dict:
+    (profile.home / "config.yaml").write_text(yaml.safe_dump(profile.config), encoding="utf-8")
+    ours = _resolve(profile)
+    names = sorted({*ours, *extra_names})
+    real = _hermes_locate(tmp_path, profile.home, names)
+    assert [(t, Path(d)) for t, d in real["roots"]] == [(r.tier, r.path) for r in search_roots(profile)]
+    index = build_index(profile, dir_hash_md5, hub_content_hash)
+    for name in names:
+        res = ours[name] if name in ours else locate(index, name)
+        path = None if res.winner_path is None else str(res.winner_path)
+        assert path == real["found"][name], name
+    return ours
+
+
+def test_matches_real_hermes_locate_skill(tmp_path):
     shared, ext = tmp_path / "shared", tmp_path / "ext"
     home = tmp_path / "hermes"
     profile = Profile(
@@ -233,24 +349,43 @@ def test_matches_real_hermes_locate_skill(tmp_path):
     _skill(local, "b/twin", "twin", ["same"])
     _skill(ext, "x/flat", "flat", ["same"])
     _skill(shared, "y/flat", "flat", ["different"])
-    (home / "config.yaml").write_text(yaml.safe_dump(profile.config), encoding="utf-8")
-    names = ["tool", "onlyshared", "dup", "twin", "flat"]
-    work = tmp_path / "cwd"
-    work.mkdir()
-    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(work), "HERMES_HOME": str(home)}
-    proc = subprocess.run(
-        [str(python), "-I", "-c", _RESOLVE_PROBE, str(src), *names],
-        check=False,
-        cwd=work,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
+    _assert_matches_hermes(tmp_path, profile)
+
+
+def test_matches_real_hermes_folder_vs_declared_name(tmp_path):
+    shared = tmp_path / "shared"
+    home = tmp_path / "hermes"
+    profile = Profile("default", home, {"skills": {"create_dir": str(shared)}})
+    local = profile.skills_dir
+    _skill(local, "l/foo", "bar", ["local folder foo"])
+    _skill(shared, "s/baz", "foo", ["shared declares foo"])
+    _skill(local, "alpha", "beta", ["one"])
+    _skill(local, "beta", "gamma", ["two"])
+    _skill(local, "g/num", "123", ["x"])
+    write_files(shared, {"notes/legacy.md": "legacy flat skill\n"})
+    _skill(local, "e/legacy-dir", "legacy", ["local declares legacy"])
+    ours = _assert_matches_hermes(
+        tmp_path,
+        profile,
+        extra_names=["baz", "l/foo", "l:foo", "plugin:l:foo", "notes/legacy", "../x", "/abs"],
     )
-    assert proc.returncode == 0, proc.stderr
-    real = json.loads(proc.stdout.strip().splitlines()[-1])
-    ours = _resolve(profile)
-    assert [(t, Path(d)) for t, d in real["roots"]] == [(r.tier, r.path) for r in search_roots(profile)]
-    for name in names:
-        winner = ours[name].winner
-        assert (None if winner is None else str(winner.path)) == real["found"][name], name
+    assert ours["foo"].winner is not None and ours["foo"].winner.rel == "l/foo"
+
+
+def test_matches_real_hermes_nested_roots(tmp_path):
+    shared = tmp_path / "shared"
+    team = shared / "team"
+    hidden = shared / ".archive" / "ext"
+    home = tmp_path / "hermes"
+    profile = Profile(
+        "default", home, {"skills": {"create_dir": str(shared), "external_dirs": [str(team), str(hidden)]}}
+    )
+    _skill(team, "n/nest", "nest", ["x"])
+    _skill(shared, "both", "both", ["same"])
+    _skill(team, "both", "both", ["same"])
+    _skill(team, "a/two", "two", ["one"])
+    _skill(team, "b/two", "two", ["other"])
+    _skill(hidden, "z", "zed", ["same"])
+    _skill(hidden, "deep/z", "zed", ["same"])
+    _skill(profile.skills_dir, "l/local", "local", ["x"])
+    _assert_matches_hermes(tmp_path, profile)
