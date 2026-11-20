@@ -145,7 +145,7 @@ def test_profile_copy_edited_after_prepare_is_not_retired(classic_fleet):
     assert not (profile_home(root, "default") / "skills" / "general" / "conflict").exists()
 
 
-def test_missing_referenced_file_fails_validation(classic_fleet):
+def test_missing_reference_that_no_variant_has_is_only_a_note(classic_fleet):
     lay = set_up(classic_fleet)
     task = conflict_task(lay)
     prepare(task, "variant:default")
@@ -153,8 +153,21 @@ def test_missing_referenced_file_fails_validation(classic_fleet):
     add_line(staged_md(task), "See [extra](references/extra.md) and `scripts/run.sh`.")
     write_files(task.staging, {"scripts/run.sh": "echo hi\n"})
     check = validate_staged(task)
+    assert check.missing_refs == [] and check.ok
+    assert any("references/extra.md" in n and "no copy has" in n for n in check.notes)
+
+
+def test_missing_reference_that_a_variant_has_blocks_accept(classic_fleet):
+    root = classic_fleet
+    write_files(profile_home(root, "device") / "skills" / "general" / "conflict", {"references/extra.md": "x\n"})
+    lay = set_up(root)
+    task = conflict_task(lay)
+    prepare(task, "variant:default")
+    add_line(staged_md(task), "D_device_only")
+    add_line(staged_md(task), "See [extra](references/extra.md).")
+    check = validate_staged(task)
     assert check.missing_refs == ["references/extra.md"]
-    assert any("references/extra.md" in p for p in check.problems)
+    assert any("references/extra.md" in p and "device:" in p for p in check.problems)
     with pytest.raises(MergeError, match="references/extra.md"):
         accept(task, check, force=True, now=LATER)
 

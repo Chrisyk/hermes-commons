@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
@@ -55,10 +56,12 @@ from commons.core.scan import SKILL_FILE, SkillCopy, read_skill_name
 TASKS_DIR = ".tasks"
 RESOLVED = "resolved"
 SKIPPED = "skipped"
-_REF_DIRS = ("references", "scripts", "templates", "assets")
 _REF_PATH = r"(?:references|scripts|templates|assets)/[^\s)`'\"<>]+"
-_LINK_REF = re.compile(r"\]\(\s*<?(" + _REF_PATH + r")>?\s*(?:\"[^\"]*\")?\)")
+_LINK = re.compile(r"\[[^\]\n]*\]\(\s*<?([^)\s<>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 _TICK_REF = re.compile(r"`(" + _REF_PATH + r")`")
+_FENCE = re.compile(r"^ {0,3}(```|~~~).*?^ {0,3}\1[^\n]*$", re.MULTILINE | re.DOTALL)
+_CODE_SPAN = re.compile(r"(`+)(?!`).+?(?<!`)\1(?!`)", re.DOTALL)
+_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
 class MergeError(RuntimeError):
@@ -326,19 +329,50 @@ def prepare(task: MergeTask, seed: str = "empty") -> Path:
 # ------------------------------------------------------------------ validate
 
 
-def referenced_files(text: str) -> list[str]:
-    """Relative support-file paths SKILL.md names in markdown links or backticks, in order, once each.
+def _clean_ref(raw: str) -> str | None:
+    ref = re.split(r"[#?]", raw, maxsplit=1)[0].rstrip(".,;:")
+    if not ref or any(ch in ref for ch in "*?[") or _SCHEME.match(ref) or ref.startswith(("/", "~", "\\")):
+        return None
+    norm = posixpath.normpath(ref)
+    if norm in (".", "") or norm == ".." or norm.startswith("../"):
+        return None  # outside the skill folder: not a file of this skill
+    return norm
 
-    Only paths under references/, scripts/, templates/ or assets/ count;
-    a '#anchor' or '?query' suffix is dropped, and glob patterns are skipped.
+
+def skill_references(text: str) -> tuple[list[str], list[str]]:
+    """(links, mentions) a SKILL.md names, in order, once each, fenced code blocks left out.
+
+    links are markdown link targets [text](relative/path) that stay inside
+    the skill folder (no URL, no absolute path, no '..' out of it): files the
+    skill really points at. mentions are paths under references/, scripts/,
+    templates/ or assets/ written in backticks and not also linked: often a
+    file of the skill, but just as often a path in some other repo, so only
+    worth a note. A '#anchor' or '?query' suffix is dropped and glob
+    patterns are skipped; a link inside an inline code span is not a link.
     """
-    out: list[str] = []
-    for m in [*_LINK_REF.finditer(text), *_TICK_REF.finditer(text)]:
-        ref = re.split(r"[#?]", m.group(1), maxsplit=1)[0].rstrip(".,;:")
-        if not ref or any(ch in ref for ch in "*?[") or ref in out:
-            continue
-        out.append(ref)
-    return out
+    text = _FENCE.sub("", text)
+    links: list[str] = []
+    for m in _LINK.finditer(_CODE_SPAN.sub("", text)):  # a link written as code is no link
+        ref = _clean_ref(m.group(1))
+        if ref is not None and ref not in links:
+            links.append(ref)
+    mentions: list[str] = []
+    for m in _TICK_REF.finditer(text):
+        ref = _clean_ref(m.group(1))
+        if ref is not None and ref not in links and ref not in mentions:
+            mentions.append(ref)
+    return links, mentions
+
+
+def referenced_files(text: str) -> list[str]:
+    """Every path skill_references finds, links first."""
+    links, mentions = skill_references(text)
+    return links + mentions
+
+
+def missing_files(folder: Path, refs: Iterable[str]) -> list[str]:
+    """The *refs* that are not there under *folder*."""
+    return [r for r in refs if not (Path(folder) / r).exists()]
 
 
 def _check_skill_md(task: MergeTask, staging: Path, check: MergeCheck) -> None:
@@ -368,11 +402,16 @@ def _check_skill_md(task: MergeTask, staging: Path, check: MergeCheck) -> None:
         declared = read_skill_name(md, folder)
         if declared != task.name or str(parsed.get("name", folder)) != task.name:
             check.problems.append(f"{task.name}: {SKILL_FILE} declares name {declared!r}, not {task.name!r}")
-    for ref in referenced_files(text):
-        parts = PurePosixPath(ref).parts
-        if ".." in parts or not (staging / ref).exists():
+    for ref in missing_files(staging, referenced_files(text)):
+        had = [v for v in task.variants if (Path(v.path) / ref).exists()]
+        if had:  # the file existed in a variant: accepting would lose it
             check.missing_refs.append(ref)
-            check.problems.append(f"{task.name}: {SKILL_FILE} references {ref}, which is not in staging")
+            check.problems.append(
+                f"{task.name}: {SKILL_FILE} references {ref}, which is not in staging "
+                f"(it is in {', '.join(f'{v.profile}:{v.rel}' for v in had)})"
+            )
+        else:
+            check.notes.append(f"{task.name}: {SKILL_FILE} names {ref}, which no copy has; not a lost file")
 
 
 def validate_staged(task: MergeTask) -> MergeCheck:

@@ -135,11 +135,42 @@ def test_name_mismatch_is_info(classic_fleet):
     assert [(f.skill, f.severity) for f in found] == [("declared-name", "info")]
 
 
-def test_missing_ref(classic_fleet):
+def test_missing_ref_link_is_warn(classic_fleet):
     lay = set_up(classic_fleet)
-    shared_skill(lay, "general/refs", {"SKILL.md": skill_md("refs", "Refs.", ["see `references/gone.md`"])})
+    lines = ["see [gone](references/gone.md) and [here](notes/here.md#x)", "[web](https://x.test/a.md)"]
+    shared_skill(lay, "general/refs", {"SKILL.md": skill_md("refs", "Refs.", lines)})
     found = codes(check(classic_fleet), "missing-ref")
-    assert [f.skill for f in found] == ["refs"] and "references/gone.md" in found[0].message
+    assert [(f.skill, f.severity) for f in found] == [("refs", "warn")]
+    assert "references/gone.md" in found[0].message and "notes/here.md" in found[0].message
+    assert "x.test" not in found[0].message
+
+
+def test_missing_ref_backtick_mention_is_info(classic_fleet):
+    lay = set_up(classic_fleet)
+    lines = [
+        "run `scripts/run_tests.sh` in the repo",
+        "```",
+        "[fenced](references/in-fence.md)",
+        "```",
+        "[up](../other/references/x.md)",
+        "pages are saved as markdown (`[text](url)`, `**bold**`)",
+    ]
+    shared_skill(lay, "general/refs", {"SKILL.md": skill_md("refs", "Refs.", lines)})
+    found = codes(check(classic_fleet), "missing-ref")
+    assert [(f.skill, f.severity) for f in found] == [("refs", "info")]
+    assert "scripts/run_tests.sh" in found[0].message and "in-fence" not in found[0].message
+
+
+def test_present_refs_are_not_flagged(classic_fleet):
+    lay = set_up(classic_fleet)
+    files = {
+        "SKILL.md": skill_md("refs", "Refs.", ["[r](references/r.md)", "`scripts/s.sh`", "[n](./notes.md)"]),
+        "references/r.md": "r\n",
+        "scripts/s.sh": "s\n",
+        "notes.md": "n\n",
+    }
+    shared_skill(lay, "general/refs", files)
+    assert codes(check(classic_fleet), "missing-ref") == []
 
 
 def test_oversize(classic_fleet):

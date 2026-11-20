@@ -15,8 +15,11 @@ run_check() reads, never writes. Findings, by code:
   bad-frontmatter      warn  a shared SKILL.md has no frontmatter block, or YAML
                              that does not parse to a mapping
   name-mismatch        info  a shared SKILL.md declares a name other than its folder
-  missing-ref          warn  a shared SKILL.md names references/, scripts/,
-                             templates/ or assets/ files that are not there
+  missing-ref          warn  a shared SKILL.md links ([text](relative/path)) to
+                             a file inside its folder that is not there
+                       info  it mentions a references/, scripts/, templates/
+                             or assets/ path in backticks that is not there
+                             (often a path in another repo)
   oversize             warn  a shared SKILL.md is over 40,000 characters
   upstream-newer       warn  a taken-over bundled or hub skill whose upstream hash
                              is no longer the origin hash recorded at take-over
@@ -58,7 +61,7 @@ from commons.core.frontmatter import frontmatter_block
 from commons.core.gitrepo import GitError, GitRepo
 from commons.core.journal import operation, read_commons_config
 from commons.core.layout import Layout
-from commons.core.merge import referenced_files
+from commons.core.merge import missing_files, skill_references
 from commons.core.paths import CRON_DIR, JOBS_FILE, CronStoreError, find_stale_paths, load_jobs_file
 from commons.core.proposal import PLUGIN, SHARED
 from commons.core.resolve import TIER_CREATE_DIR, TIER_NAMES, ScanCache, config_path, resolve
@@ -254,10 +257,22 @@ def _skill_findings(shared_root: Path, copies) -> list[Finding]:
                             f"{c.rel} declares name {c.name!r}, folder is {folder!r}",
                         )
                     )
-        missing = [r for r in referenced_files(text) if ".." in Path(r).parts or not (c.path / r).exists()]
+        links, mentions = skill_references(text)
+        missing = missing_files(c.path, links)
         if missing:
             out.append(
-                _warn("missing-ref", None, c.name, f"{c.rel}/{SKILL_FILE} names missing {', '.join(missing)}")
+                _warn("missing-ref", None, c.name, f"{c.rel}/{SKILL_FILE} links to missing {', '.join(missing)}")
+            )
+        mentioned = missing_files(c.path, mentions)
+        if mentioned:
+            out.append(
+                _info(
+                    "missing-ref",
+                    None,
+                    c.name,
+                    f"{c.rel}/{SKILL_FILE} mentions {', '.join(mentioned)}, not in the skill folder "
+                    f"(fine if it means a path elsewhere)",
+                )
             )
         if len(text) > OVERSIZE_CHARS:
             out.append(
