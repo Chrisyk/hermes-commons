@@ -453,3 +453,14 @@ def test_head_and_changed_since(repo):
     assert repo.changed_since(second) == ["a/x.md", "b/new.md"]
     with pytest.raises(ValueError):
         repo.changed_since("HEAD")
+
+
+def test_exists_at(repo):
+    _write(repo.path / "a" / "x.md", "1\n")
+    first = repo.commit_all("first")
+    _write(repo.path / "b" / "y.md", "2\n")
+    repo.commit_all("second")
+    assert repo.exists_at(first, "a") and repo.exists_at(first, repo.path / "a" / "x.md")
+    assert not repo.exists_at(first, "b")
+    with pytest.raises(ValueError):
+        repo.exists_at("main", "a")

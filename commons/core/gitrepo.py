@@ -422,6 +422,14 @@ class GitRepo:
         ).stdout
         return sorted({p for p in (listed + others).split("\0") if p})
 
+    def exists_at(self, sha: str, path: Path | str) -> bool:
+        """True if *path* (a file or folder) is in commit *sha*. Read-only: no lock taken."""
+        if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+            raise ValueError(f"bad commit sha {sha!r}: use 7 to 40 lowercase hex digits")
+        rel = self._relative(Path(path))
+        proc = self._run("cat-file", "-e", f"{sha}:{rel}", check=False, read_only=True)
+        return proc.returncode == 0
+
     def revert(self, sha: str) -> str:
         """Revert one commit with a new commit and return its sha. Aborts cleanly on conflict.
 
