@@ -11,7 +11,12 @@ round-trip, utils.atomic_roundtrip_yaml_update), and YamlFileWriter matches
 that for the keys commons writes: it edits only the lines of the key with
 the line editor in yamledit.py, checks that the edited file parses to
 exactly the intended data, and only otherwise (flow-style parent, unusual
-layout) falls back to a full yaml.safe_dump, which drops comments. Each
+layout, a quoted or spaced spelling of the key) falls back to a full
+yaml.safe_dump, which drops comments. Every parse, the check of the edited
+lines included, refuses duplicate mapping keys at any level (as Hermes'
+ruamel round-trip does): an edit that would create one falls back, and a
+config.yaml that already has one is refused with ConfigError, never
+rewritten. Each
 write returns 'edited', 'rewritten' (the fallback) or 'unchanged', and the
 writer lists its fallbacks in .fallbacks so a caller can warn.
 Stdlib + PyYAML.
@@ -28,8 +33,10 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import yaml
+from yaml.constructor import ConstructorError
 
 from commons.core.fleet import CONFIG_FILE, DEFAULT_PROFILE, Profile
+from commons.core.frontmatter import UniqueKeyLoader
 from commons.core.yamledit import Lines, Unsupported
 
 
@@ -188,7 +195,13 @@ class YamlFileWriter:
 
     def _parse(self, path: Path, text: str) -> dict:
         try:
-            data = yaml.safe_load(text)
+            data = yaml.load(text, Loader=UniqueKeyLoader)
+        except ConstructorError as exc:
+            if "duplicate key" in str(exc):
+                raise ConfigError(
+                    f"{path} has a duplicate key ({exc.problem}); refusing to rewrite it"
+                ) from exc
+            raise ConfigError(f"{path} is not valid YAML; refusing to rewrite it") from exc
         except yaml.YAMLError as exc:
             raise ConfigError(f"{path} is not valid YAML; refusing to rewrite it") from exc
         if data is None:

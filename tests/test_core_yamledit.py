@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from commons.core.configio import YamlFileWriter
+from commons.core.configio import ConfigError, YamlFileWriter
 from commons.core.fleet import Profile, discover
+from commons.core.frontmatter import _UniqueKeyLoader
 from commons.core.paths import find_stale_paths, job_keys, load_jobs_file, rewrite
 from tests.fleet import profile_home
 
@@ -200,3 +201,55 @@ def test_cron_job_without_id_is_skipped_when_list_shifted(classic_fleet):
     done, skipped = rewrite(found, root / "b", {"pikvm": jobs_path})
     assert done == [] and len(skipped) == 1
     assert jobs_path.read_bytes() == before
+
+
+def _keys_unique(text: str) -> None:
+    """Every mapping in *text* has unique keys (what Hermes' ruamel round-trip insists on)."""
+    yaml.load(text, Loader=_UniqueKeyLoader)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '"skills":\n  create_dir: /old\n',
+        "skills :\n  create_dir: /old\n",
+        "'skills':\n  create_dir: /old\n",
+        'skills:\n  "create_dir": /old\n  external_dirs: []\n',
+        "skills:\n  create_dir : /old\n",
+        'skills:\n  external_dirs: []\n  "create_dir": /old\n',
+        "skills:\n  external_dirs: []\n  ? create_dir\n  : /old\n",
+        "skills:\n  ? create_dir\n  : /old\n",
+    ],
+)
+def test_odd_key_spellings_never_create_duplicates(tmp_path, text):
+    p = _profile(tmp_path, text)
+    w = YamlFileWriter()
+    assert w.set(p, "skills.create_dir", "/new") == "rewritten"
+    after = (p.home / "config.yaml").read_text(encoding="utf-8")
+    _keys_unique(after)
+    assert yaml.safe_load(after)["skills"]["create_dir"] == "/new"
+
+
+def test_quoted_plugins_key_never_creates_duplicates(tmp_path):
+    p = _profile(tmp_path, 'plugins:\n  "enabled":\n  - a\n')
+    w = YamlFileWriter()
+    w.add_to_list(p, "plugins.enabled", "commons")
+    after = (p.home / "config.yaml").read_text(encoding="utf-8")
+    _keys_unique(after)
+    assert yaml.safe_load(after)["plugins"]["enabled"] == ["a", "commons"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "skills:\n  create_dir: /a\nskills:\n  create_dir: /b\n",
+        "skills:\n  create_dir: /a\n  create_dir: /b\n",
+        "model: x\ndisplay:\n  theme: a\n  theme: b\n",
+    ],
+)
+def test_config_with_duplicate_keys_is_refused(tmp_path, text):
+    p = _profile(tmp_path, text)
+    w = YamlFileWriter()
+    with pytest.raises(ConfigError, match="duplicate"):
+        w.set(p, "skills.create_dir", "/new")
+    assert (p.home / "config.yaml").read_text(encoding="utf-8") == text

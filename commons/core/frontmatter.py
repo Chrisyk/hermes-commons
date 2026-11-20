@@ -24,11 +24,19 @@ from yaml.constructor import ConstructorError, SafeConstructor
 _END = re.compile(r"\n---\s*\n")
 
 
-class _UniqueKeyLoader(yaml.SafeLoader):
-    """SafeLoader that refuses duplicate mapping keys, as ruamel's safe loader does."""
+class UniqueKeyLoader(yaml.SafeLoader):
+    """PyYAML's SafeLoader, except that a mapping with the same key twice is an error.
+
+    ruamel (Hermes' YAML library) refuses duplicate keys in every mapping, at
+    every level, by default.
+    """
 
 
-def _construct_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False) -> dict:
+class _UniqueKeyLoader(UniqueKeyLoader):
+    """UniqueKeyLoader plus ruamel's YAML 1.1 y/n booleans, for frontmatter."""
+
+
+def _construct_mapping(loader: UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False) -> dict:
     loader.flatten_mapping(node)
     seen: list[Any] = []
     for key_node, _ in node.value:
@@ -50,7 +58,7 @@ def _construct_bool(loader: _UniqueKeyLoader, node: yaml.ScalarNode) -> bool:
 
 # ruamel's YAML 1.1 resolver also reads bare y/Y/n/N as booleans; PyYAML does not.
 _YAML11_BOOL = {"y": True, "n": False}
-_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
+UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
 _UniqueKeyLoader.add_constructor("tag:yaml.org,2002:bool", _construct_bool)
 _UniqueKeyLoader.add_implicit_resolver("tag:yaml.org,2002:bool", re.compile(r"^(?:y|Y|n|N)$"), list("yYnN"))
 

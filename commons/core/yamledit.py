@@ -8,8 +8,9 @@ list two levels deep (skills.create_dir, plugins.enabled) under a
 block-style top-level mapping. Only the lines of that key change; every
 other line stays byte for byte. A one-line flow list ('enabled: [a, b]')
 is edited on its own line. Anything else (a flow-style parent, a
-multi-line or tagged value, tabs, a deeper key) raises Unsupported, and the
-caller falls back to a full dump. Stdlib + PyYAML.
+multi-line or tagged value, tabs, a deeper key, a key spelled quoted, with a
+space before its colon or as an explicit '? key') raises Unsupported, and
+the caller falls back to a full dump. Stdlib + PyYAML.
 """
 
 from __future__ import annotations
@@ -23,6 +24,13 @@ _TOP = re.compile(r"^(?P<key>[A-Za-z0-9_][A-Za-z0-9_.-]*):(?P<rest>(?:[ \t].*)?)
 _CHILD = re.compile(r"^(?P<indent> +)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.-]*):(?P<rest>(?:[ \t].*)?)$")
 _ITEM = re.compile(r"^(?P<indent> *)- (?P<value>.*)$")
 _SPECIAL = ("[", "{", "|", ">", "&", "*", "!", "'", '"')
+
+
+def _odd_spelling(line: str, key: str) -> bool:
+    """True when *line* holds *key* spelled other than plain 'key:' ('"key":', 'key :', '? key')."""
+    s = line.lstrip(" ")
+    k = re.escape(key)
+    return bool(re.match(rf"""(?:\?[ \t]+["']?{k}["']?[ \t]*$|["']{k}["'][ \t]*:|{k}[ \t]+:)""", s))
 
 
 class Unsupported(Exception):
@@ -129,6 +137,9 @@ class Lines:
         return last + 1
 
     def _locate(self, top_key: str, key: str) -> tuple[int, int, str, int | None]:
+        for line in self.lines:
+            if _odd_spelling(line, top_key) or _odd_spelling(line, key):
+                raise Unsupported(f"{top_key}.{key} is spelled in an unusual way")
         top = self._top(top_key)
         if top is None:
             return -1, -1, "  ", None
