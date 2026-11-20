@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from commons.core.gitrepo import GitError, GitRepo, LockTimeout
+from commons.core.gitrepo import GitError, GitRepo, GitTimeout, LockTimeout
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -136,7 +139,7 @@ def test_git_failure_raises_git_error(repo):
     with pytest.raises(GitError) as info:
         repo.revert("0" * 40)
     assert info.value.stderr
-    assert "revert" in info.value.cmd
+    assert "rev-parse" in info.value.cmd
 
 
 def _commit_many(path: str, worker: int, count: int) -> None:
@@ -232,3 +235,202 @@ def test_hooks_are_disabled(repo):
     hook.chmod(0o755)
     _write(repo.path / "a.txt", "a\n")
     assert repo.commit_all("hook would fail") is not None
+
+
+def _slow_git(tmp_path: Path) -> Path:
+    """A fake git that takes the index lock, starts a grandchild and hangs. argv is git -C <repo> ..."""
+    script = tmp_path / "slowgit"
+    script.write_text(
+        '#!/bin/sh\ntouch "$2/.git/index.lock"\nsleep 60 &\necho $! > "$2/../grandchild.pid"\nwait\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _gone(pid: int) -> bool:
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return True
+    return stat_line.rsplit(")", 1)[1].split()[0] == "Z"
+
+
+def test_hung_git_is_killed_and_its_index_lock_removed(repo, tmp_path):
+    slow = GitRepo(repo.path, git_bin=str(_slow_git(tmp_path)), git_timeout=0.5)
+    start = time.monotonic()
+    with pytest.raises(GitTimeout) as info:
+        slow.commit_all("never")
+    assert time.monotonic() - start < 10
+    assert isinstance(info.value, GitError)
+    assert not (repo.path / ".git" / "index.lock").exists()
+    grandchild = int((repo.path.parent / "grandchild.pid").read_text())
+    deadline = time.monotonic() + 5
+    while not _gone(grandchild) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _gone(grandchild)
+    # The real repo still works afterwards and the lock was released.
+    _write(repo.path / "a.txt", "a\n")
+    assert repo.commit_all("after timeout") is not None
+
+
+def test_timeout_keeps_an_index_lock_that_was_already_there(repo, tmp_path):
+    lock = repo.path / ".git" / "index.lock"
+    lock.write_text("someone else\n", encoding="utf-8")
+    slow = GitRepo(repo.path, git_bin=str(_slow_git(tmp_path)), git_timeout=0.3)
+    with pytest.raises(GitTimeout):
+        slow.commit_all("never")
+    assert lock.read_text(encoding="utf-8") == "someone else\n"
+
+
+def test_unlocked_read_timeout_never_removes_index_lock(repo, tmp_path):
+    # status runs without the repo lock, so an index.lock that appears meanwhile
+    # may belong to a concurrent locked writer and must be left alone.
+    slow = GitRepo(repo.path, git_bin=str(_slow_git(tmp_path)), git_timeout=0.3)
+    with pytest.raises(GitTimeout):
+        slow.status_porcelain()
+    assert (repo.path / ".git" / "index.lock").exists()
+
+
+def test_git_env_does_not_redirect_commits(repo, tmp_path, monkeypatch):
+    other = GitRepo(tmp_path / "other")
+    other.init()
+    monkeypatch.setenv("GIT_DIR", str(other.path / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other.path))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(other.path / ".git" / "index"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.name")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "evil")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'user.email'='evil@example.com'")
+    _write(repo.path / "z.txt", "z\n")
+    sha = repo.commit_paths([Path("z.txt")], "z")
+    assert repo.is_repo()
+    for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"):
+        monkeypatch.delenv(var)
+    assert _git(repo.path, "rev-parse", "HEAD").strip() == sha
+    assert "evil" not in _git(repo.path, "log", "-1", "--format=%an <%ae>")
+    assert _git(repo.path, "ls-files").split() == ["z.txt"]
+    assert other.log() == []
+
+
+@pytest.mark.parametrize("sub", ["backups", "staging", "retired"])
+def test_commit_all_never_commits_commons_state(repo, sub):
+    _write(repo.path / ".commons" / sub / "b1" / "config.yaml", "api_key: SECRET\n")
+    _write(repo.path / "a.txt", "a\n")
+    assert repo.status_porcelain() == ["?? a.txt"]
+    repo.commit_all("all")
+    assert _git(repo.path, "ls-files").split() == ["a.txt"]
+
+
+def test_exclude_lines_added_once(repo):
+    repo.init()
+    lines = (repo.path / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    for line in ("/.commons/lock", "/.commons/backups/", "/.commons/staging/", "/.commons/retired/"):
+        assert lines.count(line) == 1
+
+
+def test_is_repo_on_plain_dir_leaves_it_empty(tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert not GitRepo(plain).is_repo()
+    assert list(plain.iterdir()) == []
+
+
+def test_read_only_calls_take_no_lock(repo):
+    _write(repo.path / "a.txt", "a\n")
+    repo.commit_all("a")
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with repo.locked():
+            holding.set()
+            release.wait(30)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    try:
+        assert holding.wait(10)
+        blocked = GitRepo(repo.path, lock_timeout=0.2)
+        assert blocked.is_repo()
+        assert blocked.status_porcelain() == []
+        assert [e[2] for e in blocked.log()] == ["a"]
+    finally:
+        release.set()
+        t.join()
+
+
+def test_read_only_calls_do_not_create_state_dir(repo):
+    _write(repo.path / "a.txt", "a\n")
+    repo.commit_all("a")
+    (repo.path / ".commons" / "lock").unlink()
+    (repo.path / ".commons").rmdir()
+    assert repo.is_repo()
+    assert repo.status_porcelain() == []
+    assert len(repo.log()) == 1
+    assert not (repo.path / ".commons").exists()
+
+
+@pytest.mark.parametrize("bad", ["--quit", "-n", "HEAD", "abc", "g" * 40, "A" * 40, "0" * 41, ""])
+def test_revert_rejects_non_sha(repo, bad):
+    with pytest.raises(ValueError):
+        repo.revert(bad)
+
+
+def test_revert_accepts_short_sha(repo):
+    f = _write(repo.path / "a.txt", "one\n")
+    repo.commit_all("one")
+    f.write_text("two\n", encoding="utf-8")
+    bad = repo.commit_all("two")
+    repo.revert(bad[:7])
+    assert f.read_text(encoding="utf-8") == "one\n"
+
+
+def test_lock_file_names_holder_and_timeout_names_pid(repo):
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with repo.locked():
+            holding.set()
+            release.wait(30)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    try:
+        assert holding.wait(10)
+        assert repo.lock_path.read_text(encoding="utf-8").split()[0] == str(os.getpid())
+        with pytest.raises(LockTimeout) as info, GitRepo(repo.path, lock_timeout=0.2).locked():
+            pass
+        assert str(os.getpid()) in str(info.value)
+    finally:
+        release.set()
+        t.join()
+
+
+def test_four_threads_committing_all_land(repo):
+    errors: list[BaseException] = []
+
+    def work(worker: int) -> None:
+        try:
+            r = GitRepo(repo.path, lock_timeout=60)
+            for i in range(5):
+                f = _write(repo.path / f"t{worker}" / f"f{i}.txt", f"{worker}-{i}\n")
+                with r.locked():  # nested: reentrant within this thread
+                    assert r.commit_paths([f], f"thread {worker} file {i}") is not None
+        except BaseException as exc:  # noqa: BLE001 - surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(w,)) for w in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(120)
+    assert errors == []
+    assert _git(repo.path, "rev-list", "--count", "HEAD").strip() == "20"
+    assert len(_git(repo.path, "ls-files").split()) == 20
+    fsck = subprocess.run(
+        ["git", "-C", str(repo.path), "fsck", "--strict"], check=False, capture_output=True, text=True
+    )
+    assert fsck.returncode == 0, fsck.stderr
+    assert repo.status_porcelain() == []

@@ -1,17 +1,27 @@
 """A small locked wrapper around local git for the shared skill library.
 
-Every public operation holds an exclusive fcntl.flock on <path>/.commons/lock,
-so concurrent Hermes processes (hooks, cron, setup) never interleave git
-commands. Every git call disables hooks and commit signing, never prompts, and
-falls back to the identity "commons <commons@localhost>" when the repo has no
-user.name / user.email configured. Stdlib only. Linux and macOS.
+Every public operation that writes holds an exclusive fcntl.flock on
+<path>/.commons/lock, so concurrent Hermes processes and threads (hooks, cron,
+setup, the gateway's profiles) never interleave git commands. Read-only calls
+(is_repo, status_porcelain, log) take no lock, create nothing and pass
+--no-optional-locks so git does not refresh the index behind a writer.
+
+Every git call disables hooks and commit signing, never prompts, runs with a
+timeout (the whole process group is killed on expiry), ignores GIT_DIR-style
+environment overrides, and falls back to the identity
+"commons <commons@localhost>" when no user.name / user.email is configured.
+Stdlib only. Linux and macOS.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
+import re
+import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -21,14 +31,45 @@ from pathlib import Path
 LOCK_DIR = ".commons"
 LOCK_NAME = "lock"
 DEFAULT_LOCK_TIMEOUT = 10.0
+DEFAULT_GIT_TIMEOUT = 30.0
 FALLBACK_NAME = "commons"
 FALLBACK_EMAIL = "commons@localhost"
 _POLL_SECONDS = 0.05
-_EXCLUDE_LINE = f"/{LOCK_DIR}/{LOCK_NAME}"
+# State commons keeps inside the library that must never be committed: the
+# lock and the folders backups, staging copies and retired skills live in.
+_EXCLUDE_LINES = (
+    f"/{LOCK_DIR}/{LOCK_NAME}",
+    f"/{LOCK_DIR}/backups/",
+    f"/{LOCK_DIR}/staging/",
+    f"/{LOCK_DIR}/retired/",
+)
+# Same paths as pathspecs, so read-only status hides them even in a repo whose
+# info/exclude predates a line (read-only calls never write the exclude file).
+_EXCLUDE_PATHSPECS = tuple(f":(exclude,top){line.strip('/')}" for line in _EXCLUDE_LINES)
+_SHA = re.compile(r"[0-9a-f]{7,40}")
+# Environment that would point git at another repo, index or config. HOME and
+# XDG_CONFIG_HOME stay so the user's identity in ~/.gitconfig still applies.
+_ENV_DROP = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    }
+)
+_ENV_DROP_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 
 # Reentrancy bookkeeping: (lock path, thread id) -> [fd, depth]. flock locks
-# belong to an open file description, so a second open() in the same process
+# belong to an open file description, so a second open() in the same thread
 # would block on itself; nested locked() calls reuse the first fd instead.
+# Other threads open their own description and so wait like another process.
 _held: dict[tuple[str, int], list[int]] = {}
 _held_guard = threading.Lock()
 
@@ -41,14 +82,40 @@ class GitError(RuntimeError):
         super().__init__(f"git failed ({returncode}): {' '.join(cmd)}\n{stderr.strip()}")
 
 
+class GitTimeout(GitError):
+    """git ran past git_timeout; its process group was killed."""
+
+    def __init__(self, cmd: list[str], stderr: str, timeout: float):
+        self.timeout = timeout
+        super().__init__(cmd, stderr, None)
+        self.args = (f"git timed out after {timeout} s and was killed: {' '.join(cmd)}",)
+
+    def __str__(self) -> str:
+        return self.args[0]
+
+
 class LockTimeout(TimeoutError):
     pass
 
 
+def _git_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _ENV_DROP and not k.startswith(_ENV_DROP_PREFIXES)}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 class GitRepo:
-    def __init__(self, path: Path, lock_timeout: float = DEFAULT_LOCK_TIMEOUT):
+    def __init__(
+        self,
+        path: Path,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+        git_timeout: float = DEFAULT_GIT_TIMEOUT,
+        git_bin: str = "git",
+    ):
         self.path = Path(path)
         self.lock_timeout = lock_timeout
+        self.git_timeout = git_timeout
+        self.git_bin = git_bin
 
     # Locking
 
@@ -56,12 +123,19 @@ class GitRepo:
     def lock_path(self) -> Path:
         return self.path / LOCK_DIR / LOCK_NAME
 
+    def _lock_key(self) -> tuple[str, int]:
+        return (str(self.lock_path.resolve()), threading.get_ident())
+
+    def _holds_lock(self) -> bool:
+        with _held_guard:
+            return self._lock_key() in _held
+
     @contextmanager
     def locked(self) -> Iterator[None]:
-        """Hold the repo lock; reentrant within one thread of one process."""
+        """Hold the repo lock; reentrant within one thread, exclusive across threads and processes."""
         lock_path = self.lock_path
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        key = (str(lock_path.resolve()), threading.get_ident())
+        key = self._lock_key()
         with _held_guard:
             entry = _held.get(key)
             if entry is not None:
@@ -76,6 +150,7 @@ class GitRepo:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             self._acquire(fd)
+            self._write_holder(fd)
             with _held_guard:
                 _held[key] = [fd, 1]
             try:
@@ -96,27 +171,97 @@ class GitRepo:
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise LockTimeout(
-                        f"could not lock {self.lock_path} within {self.lock_timeout} s"
+                        f"could not lock {self.lock_path} within {self.lock_timeout} s; "
+                        f"held by {self._describe_holder(fd)}"
                     ) from None
                 time.sleep(_POLL_SECONDS)
 
+    @staticmethod
+    def _write_holder(fd: int) -> None:
+        """Record "<pid> <argv[0]>" in the lock file so a waiter can name the holder."""
+        argv0 = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "python"
+        data = f"{os.getpid()} {argv0}\n".encode()
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, data, 0)
+
+    @staticmethod
+    def _describe_holder(fd: int) -> str:
+        try:
+            text = os.pread(fd, 4096, 0).decode("utf-8", "replace").strip()
+        except OSError:
+            text = ""
+        if not text:
+            return "an unknown holder"
+        pid, _, argv0 = text.partition(" ")
+        return f"pid {pid} ({argv0})" if argv0 else f"pid {pid}"
+
     # Low level git
 
-    def _run(self, *args: str, check: bool = True, identity: bool = False) -> subprocess.CompletedProcess:
-        cmd = ["git", "-C", str(self.path), "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+    def _git_dir_guess(self) -> Path:
+        """<path>/.git, following a "gitdir:" file, without running git."""
+        dot_git = self.path / ".git"
+        if dot_git.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                text = dot_git.read_text(encoding="utf-8").strip()
+                if text.startswith("gitdir:"):
+                    target = Path(text.removeprefix("gitdir:").strip())
+                    return target if target.is_absolute() else self.path / target
+        return dot_git
+
+    def _run(
+        self, *args: str, check: bool = True, identity: bool = False, read_only: bool = False
+    ) -> subprocess.CompletedProcess:
+        cmd = [self.git_bin, "-C", str(self.path)]
+        if read_only:
+            cmd.append("--no-optional-locks")
+        cmd += ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
         if identity:
             cmd += self._fallback_identity()
         cmd += list(args)
-        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
-        proc = subprocess.run(
-            cmd, check=False, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL
+        # Only a lock holder may clean up index.lock after a kill: without the
+        # repo lock, a fresh index.lock may belong to a concurrent writer.
+        index_lock = self._git_dir_guess() / "index.lock" if self._holds_lock() else None
+        lock_existed = index_lock is None or index_lock.exists()
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_git_env(),
+            start_new_session=True,
         )
-        if check and proc.returncode != 0:
-            raise GitError(cmd, proc.stderr, proc.returncode)
-        return proc
+        try:
+            stdout, stderr = proc.communicate(timeout=self.git_timeout)
+        except subprocess.TimeoutExpired:
+            self._kill_group(proc)
+            if not lock_existed and index_lock is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    index_lock.unlink()
+            raise GitTimeout(cmd, "", self.git_timeout) from None
+        except BaseException:
+            self._kill_group(proc)
+            raise
+        result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        if check and result.returncode != 0:
+            raise GitError(cmd, result.stderr, result.returncode)
+        return result
+
+    @staticmethod
+    def _kill_group(proc: subprocess.Popen) -> None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Something outside the group still holds the pipes; stop reading.
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+            proc.wait()
 
     def _config_set(self, key: str) -> bool:
-        proc = self._run("config", "--get", key, check=False)
+        proc = self._run("config", "--get", key, check=False, read_only=True)
         return proc.returncode == 0 and bool(proc.stdout.strip())
 
     def _fallback_identity(self) -> list[str]:
@@ -130,29 +275,32 @@ class GitRepo:
     def _is_repo_unlocked(self) -> bool:
         if not self.path.is_dir():
             return False
-        proc = self._run("rev-parse", "--show-toplevel", check=False)
+        proc = self._run("rev-parse", "--show-toplevel", check=False, read_only=True)
         if proc.returncode != 0:
             return False
         return Path(proc.stdout.strip()).resolve() == self.path.resolve()
 
     def _ensure_excluded(self) -> None:
-        """Keep the lock file out of status and commits via .git/info/exclude."""
+        """Keep commons state (lock, backups, staging, retired) out of commits via .git/info/exclude."""
         git_dir = Path(self._run("rev-parse", "--absolute-git-dir").stdout.strip())
         exclude = git_dir / "info" / "exclude"
         try:
-            lines = exclude.read_text(encoding="utf-8").splitlines()
+            text = exclude.read_text(encoding="utf-8")
         except FileNotFoundError:
-            lines = []
-        if _EXCLUDE_LINE in lines:
+            text = ""
+        present = set(text.splitlines())
+        missing = [line for line in _EXCLUDE_LINES if line not in present]
+        if not missing:
             return
         exclude.parent.mkdir(parents=True, exist_ok=True)
         with exclude.open("a", encoding="utf-8") as fh:
-            if lines and lines[-1] != "":
+            if text and not text.endswith("\n"):
                 fh.write("\n")
-            fh.write(_EXCLUDE_LINE + "\n")
+            fh.write("".join(line + "\n" for line in missing))
 
     def _has_head(self) -> bool:
-        return self._run("rev-parse", "--verify", "-q", "HEAD", check=False).returncode == 0
+        proc = self._run("rev-parse", "--verify", "-q", "HEAD", check=False, read_only=True)
+        return proc.returncode == 0
 
     def _head(self) -> str:
         return self._run("rev-parse", "HEAD").stdout.strip()
@@ -176,11 +324,8 @@ class GitRepo:
     # Public operations
 
     def is_repo(self) -> bool:
-        """True if path is the top level of a git work tree (a subdir of another repo is not)."""
-        if not self.path.is_dir():
-            return False
-        with self.locked():
-            return self._is_repo_unlocked()
+        """True if path is the top level of a git work tree (a subdir of another repo is not). Read-only."""
+        return self._is_repo_unlocked()
 
     def init(self) -> None:
         """Create the repo on branch main if it is not one yet. Idempotent."""
@@ -191,9 +336,8 @@ class GitRepo:
             self._ensure_excluded()
 
     def status_porcelain(self) -> list[str]:
-        with self.locked():
-            self._ensure_excluded()
-            out = self._run("status", "--porcelain=v1").stdout
+        """`git status --porcelain=v1` lines, commons state hidden. Read-only: no lock taken."""
+        out = self._run("status", "--porcelain=v1", "--", ".", *_EXCLUDE_PATHSPECS, read_only=True).stdout
         return [line for line in out.split("\n") if line]
 
     def commit_paths(self, paths: list[Path], message: str) -> str | None:
@@ -228,15 +372,14 @@ class GitRepo:
 
         path filters with a plain pathspec (a folder matches everything under
         it). No --follow: git only supports it for a single file, and skill
-        moves are recorded as their own commits anyway.
+        moves are recorded as their own commits anyway. Read-only: no lock taken.
         """
         args = ["log", f"-n{int(n)}", "--format=%H%x1f%cI%x1f%s"]
         if path is not None:
             args += ["--", self._relative(path)]
-        with self.locked():
-            if not self._has_head():
-                return []
-            out = self._run(*args).stdout
+        if not self._has_head():
+            return []
+        out = self._run(*args, read_only=True).stdout
         entries = []
         for line in out.split("\n"):
             if line:
@@ -245,11 +388,20 @@ class GitRepo:
         return entries
 
     def revert(self, sha: str) -> str:
-        """Revert one commit with a new commit and return its sha. Aborts cleanly on conflict."""
+        """Revert one commit with a new commit and return its sha. Aborts cleanly on conflict.
+
+        sha must be 7 to 40 lowercase hex digits (never a ref or an option);
+        git revert takes no '--' before commits, so it is resolved to a full
+        commit id with rev-parse first and only that is passed on.
+        """
+        if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+            raise ValueError(f"bad commit sha {sha!r}: use 7 to 40 lowercase hex digits")
         with self.locked():
+            full = self._run("rev-parse", "--verify", f"{sha}^{{commit}}").stdout.strip()
             try:
-                self._run("revert", "--no-edit", sha, identity=True)
+                self._run("revert", "--no-edit", full, identity=True)
             except GitError:
-                self._run("revert", "--abort", check=False)
+                with contextlib.suppress(GitError):
+                    self._run("revert", "--abort", check=False)
                 raise
             return self._head()
