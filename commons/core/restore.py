@@ -29,13 +29,24 @@ on), takes a 'pre-restore' backup, then:
   from the newest cron_write intent of each file (superseded ones, whose
   file was edited between a crash and a resume, are never used), and only
   when the file still holds the sha256 commons wrote;
-- profile_copy intents (a shared skill copied into a profile by demote,
-  journal.py): the copy is moved aside into the pre-restore backup's
-  displaced/ folder, never deleted, when its tree_sha256 still matches.
+- the Phase 4 intents (journal.py: merge accept, promote, demote, undo),
+  newest first, each decided from the file system like the ones above:
+  a copy commons wrote (place, shared_copy, profile_copy) is moved aside
+  into the pre-restore backup's displaced/ folder (never deleted) when its
+  tree_sha256 still equals the one journaled before the copy, and a
+  half-written copy left at its staging name is moved aside too; a
+  retire_shared or set_aside copy is moved back when its hash matches; a
+  revert or checkout is undone by checking the folder out as it was at
+  head_before, but only while it still holds exactly what the undo left;
+  config.json goes back to the copy journaled before the write while it
+  still holds the bytes commons wrote. Every change to the shared root is
+  then committed as 'commons: restore <name>'.
 
-The shared root is never modified: copies into it, commits and markdown
-rewrites there are kept (markdown rewrites, partial copies and the partial
-copies a resume set aside into the backup are listed).
+For a setup, the shared root is never modified: copies into it, commits and
+markdown rewrites there are kept (markdown rewrites, partial copies and the
+partial copies a resume set aside into the backup are listed). Putting back
+what a Phase 4 operation moved out of the shared root (retire_shared,
+set_aside) is the one case restore writes a skill into the shared root.
 Every run is appended to backups/<id>/restore.json. Stdlib + PyYAML only.
 """
 
@@ -43,19 +54,21 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from commons.core.apply import CONFIG_OPS, JOURNAL_VERSION, PENDING, config_states, intents, newest_writes
+from commons.core.apply import JOURNAL_VERSION, PENDING, config_states, intents, newest_writes
 from commons.core.backup import (
     MANIFEST,
     SKILLS,
     copy_tree,
     create_backup,
     file_sha256,
+    path_sha256,
     tree_sha256,
     verify_backup,
     write_json_atomic,
@@ -147,7 +160,8 @@ class RestorePlan:
     shared_changes: list[SharedChange] = field(default_factory=list)
     shadowed_after: list[tuple[str, str]] = field(default_factory=list)  # (profile, name)
     homes: dict[str, Path] = field(default_factory=dict)  # profile -> home, from the journal
-    profile_copies: list[dict[str, Any]] = field(default_factory=list)  # demote copies to move aside
+    ops: list[dict[str, Any]] = field(default_factory=list)  # Phase 4 intents, undone newest first
+    kind: str | None = None  # the journal's command (merge, promote, ...); None for a setup
 
     @property
     def layout(self) -> Layout:
@@ -220,6 +234,113 @@ def _retire_found(path: Path, retired: Path) -> str:
     return "both" if src else "neither"
 
 
+def _plan_config(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
+    configs: dict[str, ConfigPlan] = ctx["configs"]
+    name = i["args"]["profile"]
+    if name not in configs:
+        rec = ctx["journal"]["profiles"][name]
+        configs[name] = ConfigPlan(
+            name,
+            Path(rec["home"]),
+            ctx["backup_dir"] / name / CONFIG_FILE,
+            rec["config_before_sha256"],
+            changed_externally=bool(rec.get("config_changed_externally")),
+        )
+    configs[name].intents.append(i)
+
+
+def _plan_retire(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
+    args = i["args"]
+    src, dst = Path(args["src"]), Path(args["dst"])
+    found = _retire_found(src, dst)
+    if found == "in-place":
+        return  # it never happened: nothing to undo
+    plan.retired.append(
+        RetiredPlan(
+            args["name"],
+            args["profile"],
+            args["rel"],
+            src,
+            dst,
+            args.get("fingerprint"),
+            ctx["backup_dir"] / args["profile"] / SKILLS / args["rel"],
+            i["state"],
+            found,
+        )
+    )
+
+
+def _plan_cron(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
+    if id(i) not in ctx["newest"]:
+        return  # superseded by a newer intent for the same file
+    args = i["args"]
+    plan.cron.append(
+        CronPlan(
+            args["profile"], Path(args["path"]), Path(args["backup_copy"]), args["sha_before"], args["sha_after"]
+        )
+    )
+
+
+def _plan_md(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
+    if id(i) not in ctx["newest"]:
+        return
+    args = i["args"]
+    current = file_sha256(Path(args["path"]))
+    if current == args["sha_after"]:
+        plan.md_rewrites.append(f"{args['path']} was rewritten by setup; kept (original at {args['backup_copy']})")
+    elif current != args["sha_before"]:
+        plan.undecided.append(f"shared root: {args['path']} changed since setup rewrote it; kept")
+
+
+def _plan_copy(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
+    if i["state"] == PENDING and _exists(Path(i["args"]["target"])):
+        plan.partial_copies.append(i["args"]["target"])
+
+
+def _plan_partial_set_aside(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
+    args = i["args"]
+    if i["state"] != PENDING or _exists(Path(args["dst"])):
+        plan.set_aside.append((args["src"], args["dst"]))
+
+
+def _plan_config_json(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
+    # Setup's config.json write keeps no copy of the old file: it is kept (git holds it).
+    if i["args"].get("backup_copy"):
+        plan.ops.append(i)
+
+
+def _plan_op(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
+    plan.ops.append(i)
+
+
+def _plan_nothing(plan: RestorePlan, i: dict[str, Any], ctx: dict[str, Any]) -> None:
+    """git_init and commit: the repo and its history stay (a restore commit records the undo)."""
+
+
+# Every intent op any journal writes -> how plan_restore turns it into restore work.
+_PLANNERS = {
+    "git_init": _plan_nothing,
+    "commit": _plan_nothing,
+    "config_set": _plan_config,
+    "config_list_add": _plan_config,
+    "retire": _plan_retire,
+    "cron_write": _plan_cron,
+    "md_write": _plan_md,
+    "copy": _plan_copy,
+    "partial_set_aside": _plan_partial_set_aside,
+    "config_json": _plan_config_json,
+    "retire_shared": _plan_op,
+    "place": _plan_op,
+    "shared_copy": _plan_op,
+    "profile_copy": _plan_op,
+    "set_aside": _plan_op,
+    "revert": _plan_op,
+    "checkout": _plan_op,
+    "task_file": _plan_op,
+}
+HANDLED_OPS = frozenset(_PLANNERS)
+
+
 def plan_restore(layout: Layout, backup_id: str) -> RestorePlan:
     """Read the journal of *backup_id* and list what restore would do (see module docstring)."""
     j = load_restore_journal(layout, backup_id)
@@ -232,71 +353,25 @@ def plan_restore(layout: Layout, backup_id: str) -> RestorePlan:
         complete=bool(j.get("complete")),
         since_sha=since,
         homes={name: Path(rec["home"]) for name, rec in j["profiles"].items()},
+        kind=j.get("kind"),
     )
-    configs: dict[str, ConfigPlan] = {}
-    newest = {id(i) for op in ("cron_write", "md_write") for i in newest_writes(j, op)}
+    ctx = {
+        "journal": j,
+        "backup_dir": backup_dir,
+        "configs": {},
+        "newest": {id(i) for op in ("cron_write", "md_write") for i in newest_writes(j, op)},
+    }
     for i in intents(j):
-        op, args = i["op"], i["args"]
-        if op in ("cron_write", "md_write") and id(i) not in newest:
-            continue  # superseded by a newer intent for the same file
-        if op in CONFIG_OPS:
-            name = args["profile"]
-            if name not in configs:
-                rec = j["profiles"][name]
-                configs[name] = ConfigPlan(
-                    name,
-                    Path(rec["home"]),
-                    backup_dir / name / CONFIG_FILE,
-                    rec["config_before_sha256"],
-                    changed_externally=bool(rec.get("config_changed_externally")),
-                )
-            configs[name].intents.append(i)
-        elif op == "retire":
-            src, dst = Path(args["src"]), Path(args["dst"])
-            found = _retire_found(src, dst)
-            if found == "in-place":
-                continue  # it never happened: nothing to undo
-            plan.retired.append(
-                RetiredPlan(
-                    args["name"],
-                    args["profile"],
-                    args["rel"],
-                    src,
-                    dst,
-                    args.get("fingerprint"),
-                    backup_dir / args["profile"] / SKILLS / args["rel"],
-                    i["state"],
-                    found,
-                )
-            )
-        elif op == "cron_write":
-            plan.cron.append(
-                CronPlan(
-                    args["profile"],
-                    Path(args["path"]),
-                    Path(args["backup_copy"]),
-                    args["sha_before"],
-                    args["sha_after"],
-                )
-            )
-        elif op == "md_write":
-            current = file_sha256(Path(args["path"]))
-            if current == args["sha_after"]:
-                plan.md_rewrites.append(
-                    f"{args['path']} was rewritten by setup; kept (original at {args['backup_copy']})"
-                )
-            elif current != args["sha_before"]:
-                plan.undecided.append(f"shared root: {args['path']} changed since setup rewrote it; kept")
-        elif op == "profile_copy" and _exists(Path(args["dst"])):
-            plan.profile_copies.append(dict(args))
-        elif op == "copy" and i["state"] == PENDING and _exists(Path(args["target"])):
-            plan.partial_copies.append(args["target"])
-        elif op == "partial_set_aside" and (i["state"] != PENDING or _exists(Path(args["dst"]))):
-            plan.set_aside.append((args["src"], args["dst"]))
+        planner = _PLANNERS.get(i["op"])
+        if planner is None:
+            plan.undecided.append(f"journal op {i['op']!r} is unknown to this restore; not undone")
+            continue
+        planner(plan, i, ctx)
     for aside in j.get("partials_set_aside", []):  # journals written before partial_set_aside intents
         plan.set_aside.append(("", aside))
-    plan.configs = list(configs.values())
-    plan.shared_changes = _shared_changes(plan.shared_root, since)
+    plan.configs = list(ctx["configs"].values())
+    if plan.kind is None:  # a setup: shared-root edits since are kept and listed
+        plan.shared_changes = _shared_changes(plan.shared_root, since)
     plan.shadowed_after = _shadowed_after(plan)
     return plan
 
@@ -473,17 +548,219 @@ def _copy_new(
             result.done.append(f"{profile}: copied shared {name} to {dest}")
 
 
-def _undo_profile_copy(args: Mapping[str, Any], result: RestoreResult) -> None:
-    """Move a copy demote wrote into a profile aside (never deleted), unless it changed since."""
-    dst = Path(args["dst"])
-    if not _exists(dst):
+def _next_free(path: Path) -> Path:
+    if not _exists(path):
+        return path
+    n = 2
+    while _exists(path.with_name(f"{path.name}-{n}")):
+        n += 1
+    return path.with_name(f"{path.name}-{n}")
+
+
+class _Undo:
+    """Undo the Phase 4 intents of one journal, newest first (see module docstring)."""
+
+    def __init__(self, plan: RestorePlan, result: RestoreResult):
+        self.plan = plan
+        self.result = result
+        self.root = Path(plan.shared_root)
+        self.repo = GitRepo(self.root)
+        self.touched: list[Path] = []
+        self.names: list[str] = []
+        self.demoted: list[tuple[str, str]] = []  # (name, profile) whose demote copy was undone
+
+    # ---------------------------------------------------------------- helpers
+
+    def _touch(self, path: Path, name: str | None) -> None:
+        self.touched.append(Path(path))
+        if name and name not in self.names:
+            self.names.append(name)
+
+    def _aside_path(self, path: Path) -> Path:
+        """Where *path* (in the shared root or a profile) goes in the pre-restore backup."""
+        path = Path(path)
+        displaced = self.result.pre_restore_dir / "displaced"
+        if path.is_relative_to(self.root):
+            return _next_free(displaced / "shared" / path.relative_to(self.root))
+        for name, home in self.plan.homes.items():
+            skills = Path(home) / SKILLS
+            if path.is_relative_to(skills):
+                return _next_free(displaced / name / path.relative_to(skills))
+        return _next_free(displaced / "other" / path.name)
+
+    def _move_aside(self, path: Path, why: str, name: str | None = None) -> None:
+        aside = self._aside_path(path)
+        move_noreplace(path, aside)
+        self.result.done.append(f"{path} moved aside to {aside} ({why})")
+        if Path(path).is_relative_to(self.root):
+            self._touch(path, name)
+
+    def _half_written(self, args: Mapping[str, Any]) -> None:
+        staging = args.get("staging")
+        if staging and _exists(Path(staging)):
+            self._move_aside(Path(staging), "a half-written copy")
+
+    def _undo_copy(self, i: Mapping[str, Any], what: str) -> bool:
+        """Move a copy commons wrote (place, shared_copy, profile_copy) aside; True when it did."""
+        args = i["args"]
+        self._half_written(args)
+        dst = Path(args["dst"])
+        if not _exists(dst):
+            return False
+        if not args.get("fingerprint") or tree_sha256(dst) != args["fingerprint"]:
+            if i["state"] == PENDING and not args.get("fingerprint"):
+                return False
+            self.result.reports.append(f"{dst} changed since {what} wrote it; left alone")
+            return False
+        self._move_aside(dst, f"undo {what}", args.get("name"))
+        return True
+
+    # ---------------------------------------------------------------- ops
+
+    def retire_shared(self, i: Mapping[str, Any]) -> None:
+        # The one case restore writes a skill into the shared root: putting
+        # back the copy commons itself moved out of it.
+        args = i["args"]
+        src, dst = Path(args["src"]), Path(args["dst"])
+        if _exists(src):
+            if _exists(dst):
+                self.result.reports.append(f"shared root: {src} exists now; the retired copy stays at {dst}")
+            return
+        if not _exists(dst):
+            if i["state"] != PENDING:
+                self.result.reports.append(f"shared root: retired copy {dst} is missing; {src} not restored")
+            return
+        if tree_sha256(dst) != args.get("fingerprint"):
+            self.result.reports.append(f"shared root: retired copy {dst} does not match the journal; left there")
+            return
+        move_noreplace(dst, src)
+        self.result.done.append(f"shared: {args['rel']} put back")
+        self._touch(src, args.get("name"))
+
+    def place(self, i: Mapping[str, Any]) -> None:
+        self._undo_copy(i, "merge")
+        args = i["args"]
+        src, moved_to = Path(args["src"]), Path(args.get("moved_to") or "")
+        if args.get("moved_to") and _exists(moved_to) and not _exists(src):
+            move_noreplace(moved_to, src)
+            self.result.done.append(f"merge staging put back at {src}")
+
+    def shared_copy(self, i: Mapping[str, Any]) -> None:
+        self._undo_copy(i, "promote")
+
+    def profile_copy(self, i: Mapping[str, Any]) -> None:
+        if self._undo_copy(i, "demote"):
+            self.demoted.append((i["args"]["name"], i["args"]["profile"]))
+
+    def set_aside(self, i: Mapping[str, Any]) -> None:
+        args = i["args"]
+        src, dst = Path(args["src"]), Path(args["dst"])
+        if _exists(src) or not _exists(dst):
+            return  # already back (git restored it), or never moved
+        if path_sha256(dst) != args.get("fingerprint"):
+            self.result.reports.append(f"shared root: set-aside copy {dst} does not match the journal; left there")
+            return
+        move_noreplace(dst, src)
+        self.result.done.append(f"shared: {src.relative_to(self.root)} put back")
+        self._touch(src, args.get("name"))
+
+    def _folder_back(self, i: Mapping[str, Any], expected: str | None) -> None:
+        """Put the folder *rel* back as it was at head_before, if it is still as commons left it."""
+        args = i["args"]
+        rel, before = args["path"], args.get("head_before")
+        if expected is None or before is None or not self.repo.is_repo():
+            return
+        if not self.repo.matches(expected, rel):
+            if i["state"] != PENDING:
+                self.result.reports.append(f"shared root: {rel} changed since the undo; left alone")
+            return
+        name = PurePosixPath(rel).name
+        keep = set(self.repo.files_at(before, rel))
+        for p in sorted(set(self.repo.files_at(expected, rel)) - keep):
+            if _exists(self.root / p):
+                self._move_aside(self.root / p, "not there before the undo", name)
+        if keep:
+            self.repo.checkout_path(before, rel)
+        _prune_empty(self.root / rel, self.root, {str(PurePosixPath(p).parent) for p in keep})
+        self.result.done.append(f"shared: {rel} put back as at {before[:7]}")
+        self._touch(self.root / rel, name)
+
+    def checkout(self, i: Mapping[str, Any]) -> None:
+        self._folder_back(i, i["args"]["sha"])
+
+    def revert(self, i: Mapping[str, Any]) -> None:
+        args = i["args"]
+        new = args.get("new_sha")
+        if new is None:
+            head = self.repo.head() if self.repo.is_repo() else None
+            new = head if head is not None and head != args.get("head_before") else None
+        self._folder_back(i, new)
+
+    def config_json(self, i: Mapping[str, Any]) -> None:
+        args = i["args"]
+        path, copy = Path(args["path"]), Path(args["backup_copy"])
+        current = file_sha256(path)
+        if current == args["sha_before"]:
+            return
+        if current != args.get("sha_after"):
+            if i["state"] != PENDING:
+                self.result.reports.append(f"shared root: {path} changed since commons wrote it; kept")
+            return
+        if args["sha_before"] is None:
+            self._move_aside(path, "there was none before")
+            return
+        if file_sha256(copy) != args["sha_before"]:
+            self.result.reports.append(f"shared root: backup of {path} does not match the journal; kept")
+            return
+        write_atomic(path, copy.read_bytes())
+        self.result.done.append(f"shared: {path.name} restored")
+        self._touch(path, None)
+
+    def task_file(self, i: Mapping[str, Any]) -> None:
+        src, dst = Path(i["args"]["src"]), Path(i["args"]["dst"])
+        if _exists(dst) and not _exists(src):
+            move_noreplace(dst, src)
+            self.result.done.append(f"merge task put back at {src}")
+
+    # ---------------------------------------------------------------- run
+
+    def run(self) -> None:
+        for i in reversed(self.plan.ops):
+            getattr(self, i["op"])(i)
+        paths = [p for p in dict.fromkeys(self.touched) if _exists(p) or self.repo.is_tracked(p)]
+        if paths and self.repo.is_repo():
+            label = ", ".join(self.names) or self.plan.backup_id
+            sha = self.repo.commit_paths(paths, f"commons: restore {label}")
+            if sha:
+                self.result.done.append(f"shared: committed the restore as {sha[:7]}")
+        overrides = read_overrides(self.plan.layout)
+        for name, profile in self.demoted:
+            if {"name": name, "profile": profile} in overrides:
+                self.result.reports.append(
+                    f"{profile}: the intentional override for {name} stays in .commons/config.json "
+                    f"(changed since the demote); its copy is gone"
+                )
+
+
+def read_overrides(layout: Layout) -> list[Any]:
+    try:
+        data = json.loads(Path(layout.config_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    value = data.get("intentional_overrides") if isinstance(data, dict) else None
+    return value if isinstance(value, list) else []
+
+
+def _prune_empty(folder: Path, root: Path, keep_dirs: set[str]) -> None:
+    """Remove empty folders under *folder* that the restored tree does not have (no file is touched)."""
+    if not folder.is_dir() or folder.is_symlink():
         return
-    if args.get("fingerprint") is None or tree_sha256(dst) != args["fingerprint"]:
-        result.reports.append(f"{args['profile']}: {dst} changed since it was copied in; left alone")
-        return
-    aside = result.pre_restore_dir / "displaced" / args["profile"] / args["rel"]
-    move_noreplace(dst, aside)
-    result.done.append(f"{args['profile']}: {args['rel']} moved aside to {aside}")
+    for dirpath, _dirs, _files in sorted(os.walk(folder), key=lambda t: len(t[0]), reverse=True):
+        d = Path(dirpath)
+        rel = d.relative_to(root).as_posix()
+        if d != folder and not any(k == rel or k.startswith(rel + "/") for k in keep_dirs):
+            with contextlib.suppress(OSError):
+                d.rmdir()
 
 
 @contextlib.contextmanager
@@ -565,11 +842,10 @@ def _restore_all(
 
     _copy_new(plan, by_name, copy_new_to, result)
 
-    for pc in reversed(plan.profile_copies):
-        _undo_profile_copy(pc, result)
-
     for r in reversed(plan.retired):
         _restore_retired(r, result)
+
+    _Undo(plan, result).run()
 
     for c in reversed(plan.cron):
         _restore_cron(c, result)

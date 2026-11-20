@@ -184,11 +184,26 @@ def _new_backup_dir(root: Path, stamp: str, label: str) -> tuple[str, Path]:
         return bid, target
 
 
+def json_bytes(data: dict) -> bytes:
+    """The exact bytes write_json_atomic writes for *data* (so a caller can hash them first)."""
+    return (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def path_sha256(path: Path) -> str | None:
+    """tree_sha256 of a folder, file_sha256 of a file, 'link:<target>' of a symlink; None if absent."""
+    path = Path(path)
+    if path.is_symlink():
+        return "link:" + os.readlink(path)
+    if path.is_dir():
+        return tree_sha256(path)
+    return file_sha256(path)
+
+
 def write_json_atomic(path: Path, data: dict) -> None:
     """tmp + fsync + os.replace + fsync of the parent dir."""
     tmp = path.with_name(f".{path.name}.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    with open(tmp, "wb") as fh:
+        fh.write(json_bytes(data))
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)

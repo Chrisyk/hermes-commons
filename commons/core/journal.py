@@ -14,18 +14,32 @@ promote, demote, undo, check --fix-safe). It runs, in order:
    change is first written as a pending intent, then done, then flipped.
 
 The journal reuses apply._Journal (importable here without a cycle: apply
-imports nothing from this module). Intents written here, all paths absolute:
+imports nothing from this module). Intents written here, all paths absolute. Every copy or move records the
+tree hash of what it moves BEFORE the action ('fingerprint'), so restore can
+tell a complete copy from a half-written one; every copy into a live skills
+root is written to moves.copy_staging(dst) next to the target, fsynced, then
+renamed into place (moves.copy_noreplace), so a live target is never
+half-written ('staging' names that folder):
 
   commit {kind, message, head_before}, done adds sha
-  retire {name, profile, rel, src, dst, fingerprint}  (restore puts it back)
-  retire_shared {name, rel, src, dst, fingerprint}     (restore leaves it)
-  place {name, src, dst}             staging moved into the shared root
-  shared_copy {name, src, dst}       a profile copy copied into the shared root
-  profile_copy {name, profile, rel, dst, fingerprint}  (restore moves it aside)
-  set_aside {name, src, dst}         a file moved into the backup by undo
-  revert {sha}, done adds new_sha
-  checkout {sha, path}
-  config_json {path, sha_before}, done adds sha_after
+  retire {name, profile, rel, src, dst, fingerprint}   restore puts it back
+  retire_shared {name, rel, src, dst, fingerprint}      restore puts it back
+  place {name, src, dst, staging, moved_to, fingerprint}
+                                     the merge staging copied into the shared
+                                     root, then moved into the backup;
+                                     restore moves the placed tree aside
+  shared_copy {name, src, dst, staging, fingerprint}    promote; restore moves
+                                                        it aside
+  profile_copy {name, profile, rel, src, dst, staging, fingerprint}
+                                     demote; restore moves it aside
+  set_aside {name, src, dst, fingerprint}   undo; restore puts it back
+  revert {sha, path, head_before}, done adds new_sha    restore checks out
+                                                        head_before
+  checkout {sha, path, head_before}  restore checks out head_before
+  config_json {path, sha_before, backup_copy, sha_after}  restore writes the
+                                     backup copy back while the file still
+                                     holds sha_after
+  task_file {src, dst}               the merge task moved into the backup
 
 The journal's 'kind' names the command. Nothing is ever deleted: a copy
 that must leave a skills root is retired into the backup (moves.retire),
@@ -35,6 +49,7 @@ the one the caller recorded earlier. Stdlib only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Iterator, Mapping, Sequence
@@ -45,12 +60,21 @@ from pathlib import Path
 from typing import Any
 
 from commons.core.apply import JOURNAL_VERSION, _Journal
-from commons.core.backup import create_backup, file_sha256, load_manifest, tree_sha256, write_json_atomic
+from commons.core.backup import (
+    create_backup,
+    file_sha256,
+    json_bytes,
+    load_manifest,
+    path_sha256,
+    tree_sha256,
+    write_json_atomic,
+)
 from commons.core.fleet import CONFIG_FILE, Profile, load_config
 from commons.core.gitrepo import GitRepo
 from commons.core.group import fingerprint
 from commons.core.layout import Layout
-from commons.core.moves import move_noreplace, retire, retired_path
+from commons.core.moves import copy_noreplace, copy_staging, move_noreplace, retire, retired_path
+from commons.core.paths import write_atomic
 
 SHARED_LABEL = "shared"
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -170,24 +194,90 @@ class Operation:
         return dst
 
     def move(self, op: str, name: str, src: Path, dst: Path) -> None:
-        """move_noreplace(src, dst), journaled as *op* (place or set_aside)."""
+        """move_noreplace(src, dst), journaled as *op* (set_aside) with the hash of what moves."""
 
         def action():
             move_noreplace(src, dst)
 
-        self._act(op, {"name": name, "src": str(src), "dst": str(dst)}, action)
+        self._act(op, {"name": name, "src": str(src), "dst": str(dst), "fingerprint": path_sha256(src)}, action)
+
+    def copy_in(self, op: str, name: str, src: Path, dst: Path, **extra: Any) -> dict[str, Any]:
+        """copy_noreplace(src, dst), journaled as *op* (shared_copy or profile_copy)."""
+        src, dst = Path(src), Path(dst)
+        args = {
+            "name": name,
+            **extra,
+            "src": str(src),
+            "dst": str(dst),
+            "staging": str(copy_staging(dst)),
+            "fingerprint": tree_sha256(src),
+        }
+        return self._act(op, args, lambda: copy_noreplace(src, dst) and None)
+
+    def place(self, name: str, src: Path, dst: Path) -> None:
+        """Land the folder *src* (merge staging) at *dst* in the shared root, journaled as 'place'.
+
+        The tree is copied next to the target and renamed into place
+        (copy_noreplace), then *src* itself is moved into the backup
+        (never deleted).
+        """
+        src, dst = Path(src), Path(dst)
+        moved_to = self.backup_dir / "staging" / src.name
+        args = {
+            "name": name,
+            "src": str(src),
+            "dst": str(dst),
+            "staging": str(copy_staging(dst)),
+            "moved_to": str(moved_to),
+            "fingerprint": tree_sha256(src),
+        }
+
+        def action():
+            copy_noreplace(src, dst)
+            move_noreplace(src, moved_to)
+
+        self._act("place", args, action)
 
     def write_config(self, data: dict[str, Any], message: str) -> str | None:
-        """Write shared_root/.commons/config.json atomically (journaled) and commit it."""
+        """Write shared_root/.commons/config.json atomically (journaled) and commit it.
+
+        The old file is copied into the backup first and the sha256 of the
+        new bytes is journaled before the write, so restore can tell whether
+        the write happened and put the old file back.
+        """
         path = self.layout.config_path
+        copy = _next_free(self.backup_dir / "config-json" / path.name)
+        before = file_sha256(path)
+        if before is not None:
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(copy, path.read_bytes())
+        args = {
+            "path": str(path),
+            "sha_before": before,
+            "backup_copy": str(copy),
+            "sha_after": hashlib.sha256(json_bytes(data)).hexdigest(),
+        }
 
         def action():
             path.parent.mkdir(parents=True, exist_ok=True)
             write_json_atomic(path, data)
             return {"sha_after": file_sha256(path)}
 
-        self._act("config_json", {"path": str(path), "sha_before": file_sha256(path)}, action)
+        self._act("config_json", args, action)
         return self.commit([path], message, kind="config")
+
+    def move_task_file(self, src: Path, dst: Path) -> None:
+        """Move a merge task file into the backup (journaled, restore puts it back)."""
+        self._act("task_file", {"src": str(src), "dst": str(dst)}, lambda: move_noreplace(src, dst) and None)
+
+
+def _next_free(path: Path) -> Path:
+    if not _exists(path):
+        return path
+    n = 2
+    while _exists(path.with_name(f"{path.name}-{n}")):
+        n += 1
+    return path.with_name(f"{path.name}-{n}")
 
 
 @contextmanager

@@ -74,6 +74,11 @@ _held: dict[tuple[str, int], list[int]] = {}
 _held_guard = threading.Lock()
 
 
+def literal(rel: str) -> str:
+    """A pathspec that matches *rel* exactly: no glob, no other magic, any characters."""
+    return f":(literal){rel}"
+
+
 class GitError(RuntimeError):
     def __init__(self, cmd: list[str], stderr: str, returncode: int | None = None):
         self.cmd = cmd
@@ -480,6 +485,20 @@ class GitRepo:
         with self.locked():
             full = self.resolve_commit(sha)
             self._run("checkout", "-q", full, "--", rel)
+
+    def matches(self, sha: str, path: Path | str) -> bool:
+        """True when the work tree under *path* holds exactly commit *sha*'s files (no extra ones). Read-only."""
+        full = self.resolve_commit(sha)
+        spec = literal(self._relative(Path(path)))
+        if self._run("diff", "--quiet", full, "--", spec, check=False, read_only=True).returncode != 0:
+            return False
+        others = self._run("ls-files", "--others", "-z", "--", spec, read_only=True).stdout
+        return not others.strip("\0")
+
+    def is_tracked(self, path: Path | str) -> bool:
+        """True when the index has *path* or anything under it. Read-only."""
+        spec = literal(self._relative(Path(path)))
+        return bool(self._run("ls-files", "-z", "--", spec, read_only=True).stdout.strip("\0"))
 
     def revert(self, sha: str) -> str:
         """Revert one commit with a new commit and return its sha. Aborts cleanly on conflict.

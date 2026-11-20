@@ -18,7 +18,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
-from commons.core.backup import file_sha256, tree_sha256
+from commons.core.backup import copy_tree, file_sha256, tree_sha256
 
 RETIRED = "retired"
 _AT_FDCWD = -100
@@ -201,6 +201,40 @@ def move_noreplace(src: Path, dest: Path) -> Path:
     _fsync_path(dest.parent)
     _fsync_path(src.parent)
     return dest
+
+
+def copy_staging(dest: Path) -> Path:
+    """The staging name copy_noreplace writes next to *dest* first (fixed, so a journal can name it)."""
+    dest = Path(dest)
+    return dest.with_name(f".{dest.name}.commons-copy")
+
+
+def copy_noreplace(src: Path, dest: Path) -> Path:
+    """Copy the folder *src* to *dest* so *dest* is never seen half-written; return dest.
+
+    The tree is copied to copy_staging(dest) next to it (symlinks kept),
+    every file and folder fsynced, the copy checked by tree_sha256 against
+    *src*, then renamed into place with move_noreplace. FileExistsError when
+    *dest* or the staging name already exists; a failed copy removes only
+    its own staging folder.
+    """
+    src, dest = Path(src), Path(dest)
+    if _exists(dest):
+        raise FileExistsError(f"{dest} already exists; refusing to overwrite")
+    staging = copy_staging(dest)
+    if _exists(staging):
+        raise FileExistsError(f"staging path {staging} already exists (left by an interrupted copy?)")
+    _mkdirs_durable(dest.parent)
+    try:
+        copy_tree(src, staging)
+        _fsync_path(dest.parent)
+        if tree_sha256(staging) != tree_sha256(src):
+            raise OSError(errno.EIO, f"copy of {src} did not verify; {dest} not written")
+    except Exception:
+        if _exists(staging):
+            _remove(staging)
+        raise
+    return move_noreplace(staging, dest)
 
 
 def retire(path: Path, backup_dir: Path, profile: str, rel: str) -> Path:

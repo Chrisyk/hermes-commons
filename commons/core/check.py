@@ -368,13 +368,29 @@ def run_check(
     return sorted(found, key=lambda f: f.severity != "warn")
 
 
-def fix_safe(findings: Iterable[Finding], layout: Layout) -> str | None:
+def _finish_hint(layout: Layout, bid: str) -> str:
+    return f"restore it (restore {bid}) or resume it"
+
+
+def fix_safe(findings: Iterable[Finding], layout: Layout) -> str | Finding | None:
     """Commit uncommitted shared-root changes, if a finding says there are any; return the sha.
 
     Nothing else is ever fixed here: every other finding needs a decision.
+    While any journal is unfinished nothing is committed and a finding
+    saying why (restore or resume first) is returned instead.
     """
     if not any(f.code == "uncommitted" for f in findings):
         return None
+    left = unfinished_setups(layout)
+    if left:
+        return Finding(
+            "warn",
+            "unfinished-apply",
+            None,
+            None,
+            f"not fixed: operation {left[-1]} did not finish; {_finish_hint(layout, left[-1])} first, "
+            f"so its half-done changes are not committed as edits",
+        )
     repo = GitRepo(layout.shared_root)
     if not repo.is_repo() or not repo.status_porcelain():
         return None

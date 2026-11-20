@@ -196,3 +196,19 @@ def test_render_and_quiet():
     quiet = render_findings([warn, info], quiet=True)
     assert "shadowed" in quiet and "name-mismatch" not in quiet
     assert "no problems" in render_findings([])
+
+
+def test_fix_safe_refuses_while_a_journal_is_unfinished(classic_fleet):
+    lay = set_up(classic_fleet)
+    md = lay.shared_root / "general" / "same" / "SKILL.md"
+    md.write_text("half done\n", encoding="utf-8")
+    try:
+        with operation(lay, discover(classic_fleet), "promote-x", "promote"):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    repo = GitRepo(lay.shared_root)
+    head = repo.head()
+    out = fix_safe(check(classic_fleet), lay)
+    assert isinstance(out, Finding) and "promote-x" in out.message and "restore" in out.message
+    assert repo.head() == head and repo.status_porcelain() != []

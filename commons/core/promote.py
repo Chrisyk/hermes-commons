@@ -4,12 +4,17 @@ Both follow journal.operation (lock, backup of the touched profile, write-
 ahead journal), so restore(plan_restore(layout, backup_id)) undoes either:
 
 - promote: the profile copy is retired into the backup (intent 'retire'),
-  so restore puts it back. The shared copy and its commit stay: restore
-  never modifies the shared root (see restore.py), git history holds it.
+  so restore puts it back; the copy into the shared root ('shared_copy')
+  is moved aside into the pre-restore backup when it is unchanged, and
+  restore commits that (git history keeps the promoted version).
 - demote: the copy written into the profile is journaled as 'profile_copy'
-  with its tree_sha256, so restore moves it aside into the pre-restore
-  backup (never deleted) when it is unchanged. The intentional_overrides
-  entry in .commons/config.json stays, and is harmless without the copy.
+  with the source's tree_sha256, so restore moves it aside into the
+  pre-restore backup (never deleted) when it is unchanged. The
+  intentional_overrides entry in .commons/config.json stays (restore
+  reports it).
+
+Both write their copy next to the target first and rename it into place
+(moves.copy_noreplace), so a live target is never half-written.
 
 Which copy a profile loads mirrors Hermes through resolve.py. Stdlib only.
 """
@@ -21,7 +26,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-from commons.core.backup import copy_tree, tree_sha256
 from commons.core.fleet import Profile
 from commons.core.group import TAKEN_OVER_KINDS, fingerprint, is_movable, same_content
 from commons.core.journal import operation, read_commons_config
@@ -123,13 +127,9 @@ def promote(
         sha = None
         if existing is None:
 
-            def action():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                copy_tree(copy.path, target)
-                if not same_content(copy.path, target):
-                    raise PromoteError(f"{name}: the copy at {target} does not match {copy.path}")
-
-            op._act("shared_copy", {"name": name, "src": str(copy.path), "dst": str(target)}, action)
+            op.copy_in("shared_copy", name, copy.path, target)
+            if not same_content(copy.path, target):
+                raise PromoteError(f"{name}: the copy at {target} does not match {copy.path}")
             sha = op.commit([target], f"promote {name} from {from_profile}", kind="promote")
         if copy.kind in TAKEN_OVER_KINDS:
             config = read_commons_config(layout)
@@ -184,23 +184,7 @@ def demote(
         where = ", ".join(c.rel for c in own) or source.rel
         raise PromoteError(f"{to_profile} already has {name} at {where}; nothing demoted")
     with operation(layout, [profile], f"demote-{name}", "demote", now) as op:
-
-        def action():
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            copy_tree(source.path, dest)
-            return {"fingerprint": tree_sha256(dest)}
-
-        op._act(
-            "profile_copy",
-            {
-                "name": name,
-                "profile": to_profile,
-                "rel": source.rel,
-                "dst": str(dest),
-                "src": str(source.path),
-            },
-            action,
-        )
+        op.copy_in("profile_copy", name, source.path, dest, profile=to_profile, rel=source.rel)
         config = read_commons_config(layout)
         overrides = [
             o for o in config.get("intentional_overrides", []) if o != {"name": name, "profile": to_profile}

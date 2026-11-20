@@ -49,7 +49,6 @@ from commons.core.gitrepo import GitRepo
 from commons.core.group import compare_variants, file_views, fingerprint, profile_order
 from commons.core.journal import operation, profiles_from_homes, read_commons_config
 from commons.core.layout import Layout, check_id
-from commons.core.moves import move_noreplace
 from commons.core.proposal import SHARED, Conflict, Proposal, is_create_dir_label
 from commons.core.scan import SKILL_FILE, SkillCopy, read_skill_name
 
@@ -483,8 +482,7 @@ def accept(
     with operation(layout, profiles, f"merge-{task.name}", "merge", now) as op:
         if shared is not None:
             op.retire_shared(task.name, task.target_rel)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        op.move("place", task.name, staging, target)
+        op.place(task.name, staging, target)
         sha = op.commit([target], f"merge {task.name}", kind="merge")
         kept = []
         for v in task.variants:
@@ -498,7 +496,7 @@ def accept(
         op.write_config(config, f"commons: mark {task.name} resolved")
         task_file = _task_path(layout, task.name)
         if task_file.exists():
-            move_noreplace(task_file, op.backup_dir / "merge-task.json")
+            op.move_task_file(task_file, op.backup_dir / "merge-task.json")
         op.journal.data["problems"] = kept
         return AcceptResult(op.backup_id, sha, kept, list(op.done))
 

@@ -135,7 +135,7 @@ def undo(layout: Layout, name: str, to: str | None = None, now: datetime | None 
             def action():
                 return {"new_sha": repo.revert(sha)}
 
-            entry = op._act("revert", {"sha": sha}, action)
+            entry = op._act("revert", {"sha": sha, "path": rel, "head_before": repo.head()}, action)
             new = entry["args"]["new_sha"]
             op.journal.data["git"]["final_sha"] = new
             op.journal.save()
@@ -156,6 +156,10 @@ def undo(layout: Layout, name: str, to: str | None = None, now: datetime | None 
             dst = op.backup_dir / SET_ASIDE / p
             op.move("set_aside", name, root / p, dst)
             aside.append(dst)
-        op._act("checkout", {"sha": full, "path": rel}, lambda: repo.checkout_path(full, rel))
+        op._act(
+            "checkout",
+            {"sha": full, "path": rel, "head_before": repo.head()},
+            lambda: repo.checkout_path(full, rel),
+        )
         sha = op.commit([folder.path], f"undo {name} to {full[:7]}", kind="undo")
     return UndoResult(op.backup_id, sha, set_aside=aside)
