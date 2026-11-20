@@ -154,6 +154,7 @@ def find_stale_paths(
     cron_jobs: Mapping[str, list[dict]],
     home: Path | None = None,
     exists: Callable[[Path], bool] | None = None,
+    include_files: bool = True,
 ) -> list[Finding]:
     """Every mention of a moved path in cron prompts and in *.md files of the shared root.
 
@@ -163,7 +164,8 @@ def find_stale_paths(
     the user's home); the new path keeps the old one's form. *exists* decides
     new_exists (default Path.exists); a proposal passes one that looks in
     the source copy, since the target does not exist yet. Only cron jobs of
-    the given *profiles* are read. .git and .commons are skipped.
+    the given *profiles* are read. .git and .commons are skipped;
+    include_files=False reads cron prompts only.
     """
     home = Path(home) if home is not None else Path.home()
     exists = exists or (lambda p: p.exists())
@@ -192,7 +194,7 @@ def find_stale_paths(
                 for old, new, new_abs in _matches(value, forms, home):
                     location = f"{profile} cron job {job_id} {field}"
                     add(Finding("cron", location, old, new, exists(new_abs), profile, job_id, field))
-    if Path(shared_root).is_dir():
+    if include_files and Path(shared_root).is_dir():
         for md in _iter_markdown(Path(shared_root)):
             text = _read_text(md)
             if text is None:

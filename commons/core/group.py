@@ -328,6 +328,26 @@ def _unique(c: str, survivors: list[str], contents: dict[str, dict[str, _File]])
     return lines, sorted(only)
 
 
+def content_identity(path: Path) -> frozenset[tuple[str, str, bool, str]]:
+    """The exact identity grouping uses for 'identical' (see _identity). Raises OSError."""
+    return _identity(_content(Path(path)))
+
+
+def same_content(a: Path, b: Path) -> bool:
+    """True when two skill trees are identical as grouping sees them (raw bytes, modes, folders)."""
+    return content_identity(a) == content_identity(b)
+
+
+def compare_variants(copies: list[SkillCopy]) -> dict[str, tuple[int, list[str]]]:
+    """Per copy id: (lines no other copy has in the same file, files only it has), as a conflict reports.
+
+    Raises OSError when a copy cannot be read.
+    """
+    contents = {c.id: _content(c.path) for c in copies}
+    ids = [c.id for c in copies]
+    return {cid: _unique(cid, ids, contents) for cid in ids}
+
+
 def _decide(name: str, copies: list[SkillCopy]) -> Group:
     copies = sorted(copies, key=_copy_order)
     taken_over = any(c.kind in TAKEN_OVER_KINDS for c in copies)

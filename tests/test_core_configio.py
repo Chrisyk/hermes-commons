@@ -12,7 +12,13 @@ import pytest
 import yaml
 
 from commons.core import configio
-from commons.core.configio import ConfigWriter, YamlFileWriter, hermes_config_set_argv, yaml_dump_flow
+from commons.core.configio import (
+    ConfigWriter,
+    YamlFileWriter,
+    hermes_config_set_argv,
+    hermes_config_unset_argv,
+    yaml_dump_flow,
+)
 from commons.core.fleet import Profile
 from tests.test_hash_fidelity import _hermes_python, _hermes_src
 
@@ -255,3 +261,33 @@ def test_double_dash_is_accepted_by_real_hermes(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout.strip().splitlines()[-1]) == ["set", "display.prefix", "-x"]
+
+
+def test_unset_drops_key_and_empty_parents(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "skills:\n  create_dir: /x\nplugins:\n  enabled: []\nother: 1\n", encoding="utf-8"
+    )
+    profile = Profile("default", home)
+    w = YamlFileWriter()
+    w.unset(profile, "skills.create_dir")
+    assert yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) == {
+        "plugins": {"enabled": []},
+        "other": 1,
+    }
+    before = (home / "config.yaml").read_bytes()
+    w.unset(profile, "skills.create_dir")
+    w.unset(profile, "other.deeper")
+    assert (home / "config.yaml").read_bytes() == before
+
+
+def test_unset_argv():
+    assert hermes_config_unset_argv("default", "skills.create_dir") == [
+        "hermes",
+        "config",
+        "unset",
+        "--",
+        "skills.create_dir",
+    ]
+    assert hermes_config_unset_argv("pikvm", "a.b")[:3] == ["hermes", "-p", "pikvm"]
