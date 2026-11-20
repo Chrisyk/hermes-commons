@@ -80,7 +80,9 @@ def run_crashing(monkeypatch, n: int, fn):
 
 
 def newest_backup(root: Path) -> str:
-    return max(p.name for p in layout_for(root).backups_dir.iterdir())
+    """The backup made last (ids carry the clock each test passed, so order by creation instead)."""
+    dirs = list(layout_for(root).backups_dir.iterdir())
+    return max(dirs, key=lambda d: (d / "manifest.json").stat().st_mtime_ns).name
 
 
 def restore_newest(root: Path):

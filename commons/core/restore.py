@@ -733,18 +733,19 @@ class _Undo:
             sha = self.repo.commit_paths(paths, f"commons: restore {label}")
             if sha:
                 self.result.done.append(f"shared: committed the restore as {sha[:7]}")
-        overrides = read_overrides(self.plan.layout)
+        overrides = read_overrides(self.root)
         for name, profile in self.demoted:
             if {"name": name, "profile": profile} in overrides:
                 self.result.reports.append(
-                    f"{profile}: the intentional override for {name} stays in .commons/config.json "
-                    f"(changed since the demote); its copy is gone"
+                    f"{profile}: the intentional override for {name} was left in .commons/config.json "
+                    f"(it changed after the demote); the local copy is gone, so check reports it as stale-override"
                 )
 
 
-def read_overrides(layout: Layout) -> list[Any]:
+def read_overrides(shared_root: Path) -> list[Any]:
+    """intentional_overrides in <shared_root>/.commons/config.json, [] when unreadable."""
     try:
-        data = json.loads(Path(layout.config_path).read_text(encoding="utf-8"))
+        data = json.loads((Path(shared_root) / ".commons" / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     value = data.get("intentional_overrides") if isinstance(data, dict) else None

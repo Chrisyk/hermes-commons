@@ -425,6 +425,7 @@ def validate_staged(task: MergeTask) -> MergeCheck:
     staged = file_views(staging)
     pooled = {line for f in staged if f.kind == "text" for line in f.lines}
     digests = {f.digest for f in staged if f.kind in ("text", "binary")}
+    staged_rels = {f.rel for f in staged}
     for v in task.variants:
         try:
             views = file_views(v.path)
@@ -440,6 +441,10 @@ def validate_staged(task: MergeTask) -> MergeCheck:
                         check.lost_lines.append(LostLine(v.profile, f.rel, line))
             elif f.kind == "binary" and f.digest not in digests:
                 check.lost_files.append(LostFile(v.profile, f.rel))
+                continue
+            if f.kind != "dir" and f.rel not in staged_rels:
+                what = {"link": "symlink", "binary": "file"}.get(f.kind, "empty file" if not f.lines else "file")
+                check.notes.append(f"{v.profile}:{v.rel}/{f.rel} ({what}) is not in staging under that name")
     check.staged_hash = tree_sha256(staging)
     return check
 
@@ -546,13 +551,13 @@ def accept(
             return AcceptResult(op.backup_id, sha, kept, list(op.done))
 
 
-def skip(layout: Layout, name: str) -> None:
-    """Record *name* as skipped: it stays a conflict, next_conflict passes over it."""
-    repo = GitRepo(layout.shared_root)
-    with repo.locked():
+def skip(layout: Layout, name: str, now: datetime | None = None) -> str:
+    """Record *name* as skipped (journaled; restore undoes it): it stays a conflict, next_conflict passes over it.
+
+    Returns the backup id of the operation.
+    """
+    with operation(layout, [], f"skip-{name}", "skip", now) as op:
         config = read_commons_config(layout)
         _set_names(config, SKIPPED, add=[name])
-        layout.config_path.parent.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(layout.config_path, config)
-        if repo.is_repo():
-            repo.commit_paths([layout.config_path], f"commons: skip merge of {name}")
+        op.write_config(config, f"commons: skip merge of {name}")
+    return op.backup_id

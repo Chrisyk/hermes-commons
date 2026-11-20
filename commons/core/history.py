@@ -13,6 +13,10 @@ list git show --name-only prints); otherwise it refuses and asks for
 added since (whole new folders as one) are moved into a backup (never deleted), then
 git checkout <sha> -- <folder>, then one commit 'undo <name> to <short sha>'.
 
+undo without --to refuses to revert a merge commit (merge.accept retired
+profile copies that a revert would not bring back) and names the merge's
+backup to restore instead; force reverts it anyway.
+
 Both undo forms refuse while the folder has uncommitted changes (a checkout
 or revert would overwrite them), and run through journal.operation (lock,
 backup, journal). Only the shared root changes, so the backup holds no
@@ -23,6 +27,7 @@ history here. Stdlib only.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -116,7 +121,12 @@ def _added_since(root: Path, folder: Path, before: set[str]) -> list[str]:
     return sorted(out)
 
 
-def undo(layout: Layout, name: str, to: str | None = None, now: datetime | None = None) -> UndoResult:
+MERGE_SUBJECT = "merge "
+
+
+def undo(
+    layout: Layout, name: str, to: str | None = None, now: datetime | None = None, force: bool = False
+) -> UndoResult:
     """Undo the latest change to *name*, or put it back as it was at *to* (see module docstring).
 
     Every check (the folder, uncommitted changes, the commit) runs with the
@@ -127,16 +137,43 @@ def undo(layout: Layout, name: str, to: str | None = None, now: datetime | None 
         folder = skill_folder(layout, name)
         _check_clean(repo, name, folder.rel)
         if to is None:
-            return _undo_latest(layout, repo, name, folder, now)
+            return _undo_latest(layout, repo, name, folder, now, force)
         return _undo_to(layout, repo, name, folder, to, now)
 
 
-def _undo_latest(layout: Layout, repo: GitRepo, name: str, folder: SkillCopy, now: datetime | None) -> UndoResult:
+def _merge_backup(layout: Layout, sha: str) -> str | None:
+    """The backup id of the merge journal whose commit is *sha*, if any."""
+    root = Path(layout.backups_dir)
+    if not root.is_dir():
+        return None
+    for d in sorted(root.iterdir(), reverse=True):
+        try:
+            data = json.loads((d / "journal.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("kind") != "merge":
+            continue
+        for i in data.get("intents", []):
+            if i.get("op") == "commit" and i.get("args", {}).get("sha") == sha:
+                return d.name
+    return None
+
+
+def _undo_latest(
+    layout: Layout, repo: GitRepo, name: str, folder: SkillCopy, now: datetime | None, force: bool
+) -> UndoResult:
     rel = folder.rel
     entries = repo.log(folder.path, n=1)
     if not entries:
         raise HistoryError(f"{name} has no commits to undo")
-    sha = entries[0][0]
+    sha, _date, subject = entries[0]
+    bid = _merge_backup(layout, sha)
+    if (bid is not None or subject == f"{MERGE_SUBJECT}{name}") and not force:
+        how = f"restore {bid}" if bid else "restore of that merge's backup"
+        raise HistoryError(
+            f"the latest commit touching {name} ({sha[:7]}) is a merge; reverting it would leave the profile "
+            f"copies it retired gone. Use {how} instead (or pass force to revert it anyway)"
+        )
     touched = repo.files_in_commit(sha)
     others = [p for p in touched if not _inside(p, rel)]
     if others:

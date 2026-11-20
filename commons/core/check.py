@@ -23,8 +23,11 @@ run_check() reads, never writes. Findings, by code:
   oversize             warn  a shared SKILL.md is over 40,000 characters
   upstream-newer       warn  a taken-over bundled or hub skill whose upstream hash
                              is no longer the origin hash recorded at take-over
+  stale-override       warn  an intentional_overrides entry whose profile has
+                             no local copy of that skill
   unfinished-apply     warn  a journal in the state dir is neither complete nor
-                             restored (setup or any Phase 4 operation)
+                             restored (setup or any Phase 4 operation); only
+                             a setup journal can be resumed
 
 Resolution mirrors Hermes through resolve.py (see its docstring). The
 per-skill content codes (bad-frontmatter, name-mismatch, missing-ref,
@@ -56,7 +59,7 @@ from typing import Any, Literal
 
 import yaml
 
-from commons.core.apply import intents, unfinished_setups
+from commons.core.apply import PROPOSAL_FILE, intents, unfinished_setups
 from commons.core.frontmatter import frontmatter_block
 from commons.core.gitrepo import GitError, GitRepo
 from commons.core.journal import operation, read_commons_config
@@ -65,7 +68,7 @@ from commons.core.merge import missing_files, skill_references
 from commons.core.paths import CRON_DIR, JOBS_FILE, CronStoreError, find_stale_paths, load_jobs_file
 from commons.core.proposal import PLUGIN, SHARED
 from commons.core.resolve import TIER_CREATE_DIR, TIER_NAMES, ScanCache, config_path, resolve
-from commons.core.scan import SKILL_FILE, read_hub_lock, scan_root
+from commons.core.scan import SKILL_FILE, read_hub_lock, scan_profile, scan_root
 from commons.core.verify import _override_keys
 
 Severity = Literal["warn", "info"]
@@ -371,20 +374,50 @@ def run_check(
     found += _stale_findings(profiles, layout, shared_by_name, home)
     found += _skill_findings(Path(layout.shared_root), copies)
     found += _upstream_findings(profiles, config, bundled_index)
+    found += _override_findings(profiles, config.get("intentional_overrides", []))
     for bid in unfinished_setups(layout):
         found.append(
             _warn(
                 "unfinished-apply",
                 None,
                 None,
-                f"operation {bid} did not finish; restore it (restore {bid}) or resume it",
+                f"operation {bid} did not finish; {_finish_hint(layout, bid)}",
             )
         )
     return sorted(found, key=lambda f: f.severity != "warn")
 
 
 def _finish_hint(layout: Layout, bid: str) -> str:
-    return f"restore it (restore {bid}) or resume it"
+    """'resume' only for a setup journal (it has proposal.json); any other operation can only be restored."""
+    if (layout.backup_dir(bid) / PROPOSAL_FILE).is_file():
+        return f"resume it, or restore it (restore {bid})"
+    return f"restore it (restore {bid})"
+
+
+def _override_findings(profiles, overrides) -> list[Finding]:
+    """intentional_overrides entries whose profile has no local copy of that skill (stale-override)."""
+    by_name = {p.name: p for p in profiles}
+    out = []
+    local: dict[str, set[str]] = {}
+    for o in overrides if isinstance(overrides, list) else []:
+        if not isinstance(o, Mapping) or not isinstance(o.get("profile"), str) or not isinstance(o.get("name"), str):
+            continue
+        prof, name = o["profile"], o["name"]
+        p = by_name.get(prof)
+        if p is None:
+            continue  # a profile this check was not given: nothing to say about it
+        if prof not in local:
+            local[prof] = {c.name for c in scan_profile(p, _no_hash, _no_hash)}
+        if name not in local[prof]:
+            out.append(
+                _warn(
+                    "stale-override",
+                    prof,
+                    name,
+                    f"intentional_overrides lists {name} for {prof}, but {prof} has no local copy of it",
+                )
+            )
+    return out
 
 
 def fix_safe(findings: Iterable[Finding], layout: Layout) -> str | Finding | None:
