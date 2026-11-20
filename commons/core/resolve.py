@@ -429,6 +429,23 @@ def locate(index: SkillIndex, name: str) -> Resolution:
     return _pick(name, cands)
 
 
+def locate_without(index: SkillIndex, name: str, gone: Iterable[Path]) -> Resolution:
+    """locate(index, name) as it would answer once every folder in *gone* is removed.
+
+    Used to decide, before retiring copies, where a name would resolve
+    afterwards; candidates at or under a *gone* folder are dropped before
+    the pick.
+    """
+    gone = [Path(g) for g in gone]
+    if not isinstance(name, str) or _lookup_error(name) or not index.roots:
+        return Resolution(name=name, winner=None, winner_tier=None)
+    try:
+        cands = _collect(index, name, None)
+    except ValueError:
+        return Resolution(name=name, winner=None, winner_tier=None)
+    return _pick(name, [c for c in cands if not any(c.file.is_relative_to(g) for g in gone)])
+
+
 def resolve_index(index: SkillIndex) -> dict[str, Resolution]:
     """Every declared skill name in *index*, answered as Hermes skill_view(name) would."""
     names = {index_name(f.file, index.cache) for f in index.copies()}

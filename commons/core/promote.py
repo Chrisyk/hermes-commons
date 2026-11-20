@@ -46,6 +46,7 @@ class PromoteResult:
     sha: str | None  # None when the shared root already held identical content
     target: Path
     others: list[str] = field(default_factory=list)  # profiles still loading their own copy
+    kept: list[str] = field(default_factory=list)  # why the profile's own copy was left in place
 
 
 @dataclass
@@ -157,10 +158,13 @@ def _promote(
             if entry not in taken:
                 config["taken_over"] = [*taken, entry]
                 op.write_config(config, f"commons: record take-over of {name}")
-        for c in mine:
+        kept = op.shared_use(name, from_profile, [c.rel for c in mine])
+        for c in mine if kept is None else ():
             why = op.retire_profile_copy(name, from_profile, c.rel, before)
             if why is not None:
                 raise PromoteError(f"{name}: {why}; the shared copy is committed, the local one stays")
+        if kept is not None:
+            op.journal.data["problems"] = [kept]
     others = []
     cache = ScanCache()
     shared_root = config_path(Path("/"), Path(layout.shared_root))
@@ -170,7 +174,7 @@ def _promote(
         r = resolve(p, md5_dir_hash, hub_hash, cache=cache).get(name)
         if r is not None and r.winner_path is not None and not r.winner_path.is_relative_to(shared_root):
             others.append(p.name)
-    return PromoteResult(op.backup_id, sha, target, others)
+    return PromoteResult(op.backup_id, sha, target, others, [kept] if kept else [])
 
 
 def demote(

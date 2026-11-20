@@ -14,8 +14,8 @@ promote, demote, undo, check --fix-safe). It runs, in order:
    change is first written as a pending intent, then done, then flipped.
 
 The journal reuses apply._Journal (importable here without a cycle: apply
-imports nothing from this module). Intents written here, all paths absolute. Every copy or move records the
-tree hash of what it moves BEFORE the action ('fingerprint'), so restore can
+imports nothing from this module). Intents written here, all paths
+absolute. Every copy or move records the tree hash of what it moves BEFORE the action ('fingerprint'), so restore can
 tell a complete copy from a half-written one; every copy into a live skills
 root is written to moves.copy_staging(dst) next to the target, fsynced, then
 renamed into place (moves.copy_noreplace), so a live target is never
@@ -44,7 +44,8 @@ half-written ('staging' names that folder):
 The journal's 'kind' names the command. Nothing is ever deleted: a copy
 that must leave a skills root is retired into the backup (moves.retire),
 and a profile copy is only retired when its group.fingerprint still equals
-the one the caller recorded earlier. Stdlib only.
+the one the caller recorded earlier and the profile, per resolve, loads the
+name from the shared root once its copy is gone (shared_use). Stdlib only.
 """
 
 from __future__ import annotations
@@ -75,6 +76,7 @@ from commons.core.group import fingerprint
 from commons.core.layout import Layout
 from commons.core.moves import copy_noreplace, copy_staging, move_noreplace, retire, retired_path
 from commons.core.paths import write_atomic
+from commons.core.resolve import TIER_CREATE_DIR, build_index, config_path, locate_without
 
 SHARED_LABEL = "shared"
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -86,6 +88,10 @@ def safe_label(text: str) -> str:
     """*text* made into a backup label (letters, digits, '.', '_', '-')."""
     out = _UNSAFE.sub("_", text).strip("._-")
     return out or "skill"
+
+
+def _no_hash(_path: Path) -> str:
+    return ""
 
 
 def profiles_from_homes(homes: Mapping[str, Path | str]) -> list[Profile]:
@@ -152,6 +158,27 @@ class Operation:
             self.journal.save()
         return sha
 
+    def shared_use(self, name: str, profile: str, rels: Sequence[str]) -> str | None:
+        """None when *profile* loads *name* from the shared root once *rels* are retired; else why not.
+
+        Checked with resolve, from the profile's config.yaml as it is now:
+        its skills.create_dir must resolve to the shared root, and with the
+        copies at *rels* gone the name must resolve to a copy in the shared
+        root. A copy is only ever retired when both hold, so no profile
+        loses a skill it still needs.
+        """
+        current = self.profiles[profile]
+        p = Profile(current.name, current.home, load_config(Path(current.home) / CONFIG_FILE))
+        shared = config_path(Path("/"), Path(self.layout.shared_root))
+        index = build_index(p, _no_hash, _no_hash)
+        if not any(r.tier == TIER_CREATE_DIR and r.path == shared for r in index.roots):
+            return f"{profile} does not use the shared root; its copy was left in place"
+        after = locate_without(index, name, [p.skills_dir / rel for rel in rels])
+        if after.winner_path is None or not after.winner_path.is_relative_to(shared):
+            where = after.winner_path or "nothing"
+            return f"{profile} would load {name} from {where}, not the shared root; its copy was left in place"
+        return None
+
     def retire_profile_copy(self, name: str, profile: str, rel: str, expected: str | None) -> str | None:
         """Retire a profile's copy into the backup; return None, or why it was kept.
 
@@ -161,6 +188,9 @@ class Operation:
         path = self.profiles[profile].skills_dir / rel
         if not _exists(path):
             return f"{profile}:{rel} is gone; nothing to retire"
+        why = self.shared_use(name, profile, [rel])
+        if why is not None:
+            return why
         try:
             current = fingerprint(path)
         except OSError as exc:

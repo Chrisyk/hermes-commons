@@ -42,7 +42,7 @@ from typing import Any
 
 import yaml
 
-from commons.core.apply import JOURNAL, PROPOSAL_FILE, load_setup_proposal
+from commons.core.apply import JOURNAL, PROPOSAL_FILE, RESTORE_LOG, load_setup_proposal
 from commons.core.backup import copy_tree, tree_sha256, write_json_atomic
 from commons.core.frontmatter import frontmatter_block
 from commons.core.gitrepo import GitRepo
@@ -173,12 +173,12 @@ def load_task(layout: Layout, name: str) -> MergeTask | None:
 
 
 def saved_proposal(layout: Layout) -> Proposal | None:
-    """The proposal of the newest finished setup in the state dir, or None."""
+    """The proposal of the newest finished setup in the state dir that was not restored, or None."""
     root = Path(layout.backups_dir)
     if not root.is_dir():
         return None
     for d in sorted(root.iterdir(), reverse=True):
-        if not (d / PROPOSAL_FILE).is_file():
+        if not (d / PROPOSAL_FILE).is_file() or (d / RESTORE_LOG).exists():
             continue
         try:
             journal = json.loads((d / JOURNAL).read_text(encoding="utf-8"))
