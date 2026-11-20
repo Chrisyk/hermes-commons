@@ -1,7 +1,7 @@
 """Tests for commons.core.scan skill walk and provenance."""
 
 from commons.core.fleet import discover
-from commons.core.scan import scan_profile, tree_hash
+from commons.core.scan import read_manifest, scan_profile, tree_hash
 from tests.fleet import dir_hash_md5, hub_content_hash, skill_md, write_files
 
 
@@ -124,16 +124,81 @@ def test_corrupt_lock_and_manifest_do_not_crash(classic_fleet):
     assert kinds["tools/hubskill"] == "own"
     (skills / ".hub" / "lock.json").write_text('{"installed": ["wrong", "shape"]}', encoding="utf-8")
     assert _by_rel(_scan(classic_fleet, "default"))["tools/hubskill"].kind == "own"
-    (skills / ".bundled_manifest").write_bytes(b"\xff\xfe garbage\n\n:nohash-name\nnocolon\n")
+    (skills / ".bundled_manifest").write_bytes(b"\xff\xfe garbage\n\n:nohash-name\n")
     kinds = {c.rel: c.kind for c in _scan(classic_fleet, "default")}
     assert kinds["bundled/bundled-pristine"] == "own"
 
 
-def test_malformed_manifest_lines_ignored(classic_fleet):
+def test_blank_lines_and_orphan_ignored(classic_fleet):
     manifest = classic_fleet / "skills" / ".bundled_manifest"
-    manifest.write_text("\n   \ngarbage-line\n:orphan\n" + manifest.read_text(), encoding="utf-8")
+    manifest.write_text("\n   \n:orphan\n" + manifest.read_text(), encoding="utf-8")
+    entries = read_manifest(manifest.parent)
+    assert set(entries) == {"bundled-pristine", "bundled-edited"}
     kinds = {c.rel: c.kind for c in _scan(classic_fleet, "default")}
     assert kinds["bundled/bundled-pristine"] == "bundled-pristine"
+
+
+def test_orphan_line_does_not_match_anything(classic_fleet):
+    skills = classic_fleet / "skills"
+    (skills / ".bundled_manifest").write_text(":orphan\n", encoding="utf-8")
+    assert read_manifest(skills) == {}
+    kinds = {c.rel: c.kind for c in _scan(classic_fleet, "default")}
+    assert kinds["bundled/bundled-pristine"] == "own"
+    assert kinds["bundled/bundled-edited"] == "own"
+
+
+def test_v1_plain_name_line_is_pristine_with_empty_origin(classic_fleet):
+    skills = classic_fleet / "profiles" / "pikvm" / "skills"
+    (skills / ".bundled_manifest").write_text("  bundled-edited  \n", encoding="utf-8")
+    assert read_manifest(skills) == {"bundled-edited": ""}
+    copy = _by_rel(_scan(classic_fleet, "pikvm"))["bundled/bundled-edited"]
+    assert copy.kind == "bundled-pristine"
+    assert copy.origin_hash == ""
+
+
+def test_v2_line_with_empty_hash_is_pristine_with_empty_origin(classic_fleet):
+    skills = classic_fleet / "profiles" / "pikvm" / "skills"
+    (skills / ".bundled_manifest").write_text("bundled-edited:\nbundled-pristine :  \n", encoding="utf-8")
+    assert read_manifest(skills) == {"bundled-edited": "", "bundled-pristine": ""}
+    copies = _by_rel(_scan(classic_fleet, "pikvm"))
+    for rel in ("bundled/bundled-edited", "bundled/bundled-pristine"):
+        assert copies[rel].kind == "bundled-pristine"
+        assert copies[rel].origin_hash == ""
+
+
+def test_manifest_matched_by_frontmatter_name(classic_fleet):
+    skills = classic_fleet / "profiles" / "pocket" / "skills"
+    write_files(skills / "general/folder-x", {"SKILL.md": skill_md("fm-name", "d", ["x"])})
+    path = skills / "general" / "folder-x"
+    origin = dir_hash_md5(path)
+    with (skills / ".bundled_manifest").open("a", encoding="utf-8") as fh:
+        fh.write(f"fm-name:{origin}\nfolder-x:deadbeef\n")
+    copy = _by_rel(_scan(classic_fleet, "pocket"))["general/folder-x"]
+    assert copy.name == "fm-name"
+    assert copy.kind == "bundled-pristine"
+    assert copy.origin_hash == origin
+
+
+def test_manifest_frontmatter_name_only(classic_fleet):
+    skills = classic_fleet / "profiles" / "pocket" / "skills"
+    write_files(skills / "general/folder-y", {"SKILL.md": skill_md("fm-only", "d", ["x"])})
+    with (skills / ".bundled_manifest").open("a", encoding="utf-8") as fh:
+        fh.write("fm-only:deadbeef\n")
+    copy = _by_rel(_scan(classic_fleet, "pocket"))["general/folder-y"]
+    assert copy.kind == "bundled-edited"
+    assert copy.origin_hash == "deadbeef"
+
+
+def test_manifest_folder_fallback_without_frontmatter_name(classic_fleet):
+    skills = classic_fleet / "profiles" / "pocket" / "skills"
+    write_files(skills / "general/plainfolder", {"SKILL.md": "---\ndescription: x\n---\nbody\n"})
+    path = skills / "general" / "plainfolder"
+    origin = dir_hash_md5(path)
+    with (skills / ".bundled_manifest").open("a", encoding="utf-8") as fh:
+        fh.write(f"plainfolder:{origin}\n")
+    copy = _by_rel(_scan(classic_fleet, "pocket"))["general/plainfolder"]
+    assert copy.kind == "bundled-pristine"
+    assert copy.origin_hash == origin
 
 
 def test_missing_skills_dir(tmp_path):

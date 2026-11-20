@@ -92,17 +92,26 @@ def read_frontmatter_name(skill_md: Path) -> str | None:
 
 
 def read_manifest(skills_dir: Path) -> dict[str, str]:
-    """Parse .bundled_manifest lines 'name:hash'; blank or malformed lines are ignored."""
+    """Parse .bundled_manifest as Hermes tools/skills_sync.py _read_manifest does.
+
+    Lines are stripped and blank ones skipped. A line with ':' is v2 'name:hash'
+    (both parts stripped, hash may be empty); a line without ':' is a v1 plain
+    name with hash ''. Only entries whose name is empty (e.g. ':orphan') are
+    dropped. A missing or unreadable file yields {}.
+    """
     try:
         text = (skills_dir / MANIFEST_FILE).read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return {}
     entries: dict[str, str] = {}
     for line in text.splitlines():
-        name, sep, value = line.strip().partition(":")
-        name, value = name.strip(), value.strip()
-        if sep and name and value:
-            entries[name] = value
+        line = line.strip()
+        if not line:
+            continue
+        name, _, value = line.partition(":")
+        name = name.strip()
+        if name:
+            entries[name] = value.strip()
     return entries
 
 
@@ -160,13 +169,22 @@ def scan_profile(
     for path in _walk_skill_dirs(skills_dir):
         rel = path.relative_to(skills_dir).as_posix()
         folder = path.name
-        name = read_frontmatter_name(path / SKILL_FILE) or folder
+        fm_name = read_frontmatter_name(path / SKILL_FILE)
+        name = fm_name or folder
+        # Hermes _discover_bundled_skills keys the manifest by the frontmatter
+        # name, falling back to the folder name; frontmatter wins.
+        key = next((k for k in (fm_name, folder) if k and k in manifest), None)
         origin: str | None = None
         if path.is_symlink():
             kind = "symlink"
-        elif folder in manifest:
-            origin = manifest[folder]
-            kind = "bundled-pristine" if md5_dir_hash(path) == origin else "bundled-edited"
+        elif key is not None:
+            origin = manifest[key]
+            # An empty origin is a v1 entry: Hermes _update_existing_skill
+            # re-baselines it from the user's copy, so it counts as pristine.
+            if origin == "" or md5_dir_hash(path) == origin:
+                kind = "bundled-pristine"
+            else:
+                kind = "bundled-edited"
         elif (entry := _hub_entry(lock, folder, name, rel)) is not None:
             recorded = entry.get("content_hash")
             origin = recorded if isinstance(recorded, str) else None
