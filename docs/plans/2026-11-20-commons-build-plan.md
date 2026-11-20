@@ -8,7 +8,7 @@ Architecture: a pure-Python core (`commons/core/`) that works on plain folders a
 
 Tech stack: Python >= 3.11, stdlib plus PyYAML (Hermes already ships it), git CLI, pytest. Developed against Hermes v0.23.1 (c9c87fc).
 
-Repo: `/home/chris/hermes-commons` (local only until Phase 6; never commit Chris's real skills).
+Repo: `~/hermes-commons` (local only until Phase 6; never commit Chris's real skills).
 
 Style rules for every task: no em-dashes anywhere (code, comments, tests, commits); plain commit messages; no network calls; nothing is deleted, only moved to a backup.
 
@@ -267,7 +267,7 @@ At the end of `setup --apply`, if the user accepts: write `<default home>/script
 
 ### Task 5.6: Validator
 
-Run `hermes plugins validate /home/chris/hermes-commons --install-deps`. Fix every failure and every warning about non-public imports. Gate: zero failures.
+Run `hermes plugins validate ~/hermes-commons --install-deps`. Fix every failure and every warning about non-public imports. Gate: zero failures.
 
 ---
 
