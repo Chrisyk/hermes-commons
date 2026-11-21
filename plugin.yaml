@@ -1,5 +1,5 @@
 name: commons
-version: "0.2.0"
+version: "0.2.1"
 description: "One live skill library for every Hermes profile: setup, drift checks, per-edit git history."
 author: Christopher Ko
 requires_hermes: ">=0.23.0"

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 (2026-11-21)
+
+- Fix enabling commons in more than one profile: Hermes refused the second
+  profile ("Two workspace members are both named hermes-commons"). The
+  package no longer declares a build backend, so Hermes names each
+  profile's copy uniquely.
+
 ## 0.2.0 (2026-11-21)
 
 - Consistency settings, `hermes commons config`: `lock own|shared` and

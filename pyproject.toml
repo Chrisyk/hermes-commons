@@ -1,10 +1,9 @@
-[build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
-
+# No [build-system]: Hermes then treats the plugin as a virtual workspace member and names each
+# profile's copy uniquely. With a build backend, two profiles enabling commons both declare
+# hermes-commons and Hermes' `uv lock` refuses the environment.
 [project]
 name = "hermes-commons"
-version = "0.2.0"
+version = "0.2.1"
 description = "One live skill library for every Hermes profile."
 license = { text = "MIT" }
 authors = [{ name = "Christopher Ko" }]
