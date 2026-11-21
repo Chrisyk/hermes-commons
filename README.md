@@ -105,6 +105,10 @@ updating (and after turning the guard on) so they load the new code. If
 `update` says the plugin is pinned, reinstall it:
 `hermes plugins install Chrisyk/hermes-commons --enable --force`.
 
+If a second profile failed to enable 0.1.0 or 0.2.0 with "Two workspace
+members are both named hermes-commons", update to 0.2.1 or later, then run
+`hermes plugins enable commons` in that profile again.
+
 ## How it differs from Guild
 
 [Guild](https://github.com/Nnadijoshuac/hermes-guild) is a team library: skills are proposed,
