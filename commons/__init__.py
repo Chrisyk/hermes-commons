@@ -47,6 +47,50 @@ def on_session_start(**kw) -> None:
     hooks.on_session_start(**kw)
 
 
+def pre_tool_call(**kw):
+    try:
+        from commons import guard
+    except ImportError as exc:
+        logging.getLogger("commons.guard").warning(_missing(exc))
+        return None
+    return guard.pre_tool_call(**kw)
+
+
+def post_tool_call(**kw) -> None:
+    try:
+        from commons import guard
+    except ImportError:
+        return
+    guard.post_tool_call(**kw)
+
+
+def _guard_wanted() -> bool:
+    """True when consistency.json turns the guard on for some profile (stdlib only; False on any doubt).
+
+    Read once at plugin load, so the default (no file, guard off) registers no
+    tool hook at all and costs nothing per tool call.
+    """
+    import json
+    import os
+
+    try:
+        root = os.environ.get("COMMONS_HERMES_ROOT", "").strip()
+        if root:
+            home = Path(root).expanduser()
+        else:
+            from hermes_constants import get_default_hermes_root
+
+            home = Path(get_default_hermes_root())
+        data = json.loads((home / "commons" / "consistency.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - no file, no Hermes, bad JSON: the guard stays off
+        return False
+    if not isinstance(data, dict):
+        return False
+    overrides = data.get("guard_overrides")
+    levels = [data.get("guard"), *(overrides.values() if isinstance(overrides, dict) else [])]
+    return any(level in ("warn", "strict") for level in levels)
+
+
 def setup_fn(parser) -> None:
     try:
         from commons import cli
@@ -78,6 +122,9 @@ def register(ctx) -> None:
     """Hermes plugin entry point: hooks, `hermes commons`, `/commons` and the commons skill (a Path)."""
     ctx.register_hook("on_skill_lifecycle", on_skill_lifecycle)
     ctx.register_hook("on_session_start", on_session_start)
+    if _guard_wanted():
+        ctx.register_hook("pre_tool_call", pre_tool_call)
+        ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_cli_command(
         "commons",
         help="one shared skill library for every profile",

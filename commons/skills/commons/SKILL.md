@@ -16,6 +16,13 @@ Rules:
 - To share a profile's own skill, run `hermes commons promote S --from P`.
 - Find where a skill resolves: `hermes commons status --skill S`.
 - History and undo: `hermes commons log S`, `hermes commons undo S`.
+- Other agents edit shared skills too. Prefer a patch whose old_string is
+  copied exactly from text you just read over rewriting the whole file.
+- If a write is refused with "commons: nothing was written", read the file
+  again in a separate step and re-apply your change to the new text. Do not
+  resend the same call.
+- Consistency settings: `hermes commons config` (lock, guard). Change them
+  only when the user asks.
 
 Agent merge of a conflict (copies that differ between profiles):
 1. `hermes commons merge --next` prints the variants, their unique lines

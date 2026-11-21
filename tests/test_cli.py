@@ -291,7 +291,7 @@ class FakeCtx:
 def test_register_wires_hooks_cli_and_slash():
     ctx = FakeCtx()
     commons.register(ctx)
-    assert {n for n, _ in ctx.hooks} == {"on_skill_lifecycle", "on_session_start"}
+    assert {n for n, _ in ctx.hooks} == {"on_skill_lifecycle", "on_session_start"}  # guard off: no tool hooks
     assert [n for n, _s, _h in ctx.cli] == ["commons"]
     assert [(n, a) for n, _h, a in ctx.commands] == [("commons", "status|check")]
 
@@ -519,3 +519,59 @@ def test_undo_with_no_commits_fails_before_asking(env, monkeypatch, capsys):
     assert run("undo", "fresh") == 1
     io_ = capsys.readouterr()
     assert "has no commits" in io_.err and "[y/N]" not in io_.out
+
+
+# ------------------------------------------------------------------ consistency config
+
+
+def test_first_setup_shares_the_lock_and_restore_puts_it_back(env, capsys):
+    from commons.core import consistency as cons
+
+    before = snapshot(env["root"])
+    applied(env)
+    out = capsys.readouterr().out
+    assert "consistency: lock shared, guard off" in out
+    s = cons.read_settings(env["state"])
+    assert (s.lock, s.guard) == ("shared", "off")
+    shared_locks = cons.lock_target(env["state"], "", "shared")
+    assert all(cons.link_state(p).points_to(shared_locks) for p in discover(env["root"]))
+    bid = list_backups(env["layout"])[0]
+    assert run("restore", bid, "--yes") == 0
+    assert "own skills/.locks put back" in capsys.readouterr().out
+    assert snapshot(env["root"]) == before
+    assert not cons.read_settings(env["state"]).exists
+
+
+def test_setup_lock_own_keeps_hermes_default(env, capsys):
+    from commons.core import consistency as cons
+
+    run("setup")
+    assert run("setup", "--apply", "--yes", "--lock", "own") == 0
+    assert cons.read_settings(env["state"]).lock == "own"
+    assert all(cons.link_state(p).kind != "link" for p in discover(env["root"]))
+
+
+def test_config_show_set_and_restart_hint(env, capsys):
+    from commons.core import consistency as cons
+
+    assert run("config") == 0
+    assert "lock: own" in capsys.readouterr().out
+    assert run("config", "set", "guard", "strict") == 2  # needs confirmation
+    assert run("config", "set", "guard", "strict", "--yes") == 0
+    assert "restart" in capsys.readouterr().out
+    assert run("config", "set", "guard.pocket", "off", "--yes") == 0
+    assert run("config", "set", "guard.nobody", "off", "--yes") == 1
+    assert run("config", "set", "guard", "loud", "--yes") == 2
+    assert run("config", "set", "lock", "shared", "--yes") == 0
+    s = cons.read_settings(env["state"])
+    assert (s.lock, s.guard, dict(s.guard_overrides)) == ("shared", "strict", {"pocket": "off"})
+    assert run("check") in (0, 1)
+    out = capsys.readouterr().out
+    assert "guard-override" in out and "locks-unshared" not in out
+    assert run("config", "set", "guard.pocket", "unset", "--yes") == 0
+    assert dict(cons.read_settings(env["state"]).guard_overrides) == {}
+
+
+def test_status_shows_the_consistency_line(env, capsys):
+    assert run("status") == 0
+    assert "consistency: lock own, guard off" in capsys.readouterr().out

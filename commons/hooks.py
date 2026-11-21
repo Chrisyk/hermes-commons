@@ -10,6 +10,13 @@ the shared root commits just that folder (git timeout 30 s, repo lock 10 s);
 any failure is logged at warning, never raised. A full queue drops the
 event with a warning: the change stays in the work tree and `commons check
 --fix-safe` commits it later. At exit the queue gets a few seconds to drain.
+With consistency lock shared, the hook also copies the skill's files
+before it queues the commit (it runs inside Hermes' per-skill lock, which
+lock shared makes common to every profile). If the folder has changed again
+by the time the commit runs, or is gone, that copy is saved under
+<state dir>/overwritten/ and check reports it, so no version written through
+the skill tool is lost before git sees it. With lock own (the default) the
+hook only stats consistency.json and queues the commit, as before.
 While any commons journal is unfinished (an interrupted setup or operation,
 see apply.unfinished_setups) the hook commits nothing and logs a warning,
 the same rule check --fix-safe follows. Each job runs in the caller's
@@ -37,6 +44,7 @@ import os
 import queue
 import threading
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +62,8 @@ log = logging.getLogger("commons.hooks")
 COMMIT_ACTIONS = frozenset({"created", "edited", "patched"})
 CACHE_FILE = "cache.json"
 QUEUE_SIZE = 64
+OVERWRITTEN_DIR = "overwritten"
+SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024
 EXIT_DRAIN_SECONDS = 5.0
 
 
@@ -139,7 +149,73 @@ def _inside(path: Path, root: Path) -> bool:
 # ------------------------------------------------------------------ on_skill_lifecycle
 
 
-def _commit_skill(action: str, name: str, session_id: str) -> None:
+Snapshot = dict[str, bytes]
+
+
+def _read_tree(folder: Path, cap: int = SNAPSHOT_MAX_BYTES) -> Snapshot | None:
+    """rel -> bytes of every file under *folder* (no .git); None when over *cap* or unreadable."""
+    out: Snapshot = {}
+    total = 0
+    try:
+        for p in sorted(folder.rglob("*")):
+            if ".git" in p.relative_to(folder).parts or not p.is_file() or p.is_symlink():
+                continue
+            data = p.read_bytes()
+            total += len(data)
+            if total > cap:
+                return None
+            out[p.relative_to(folder).as_posix()] = data
+    except OSError:
+        return None
+    return out
+
+
+def _snapshot(name: str) -> tuple[Path, Snapshot] | None:
+    """The skill's files now, when lock is shared and the skill lives in the shared root."""
+    from commons import guard
+
+    if guard.cached_settings().lock != "shared":
+        return None
+    folder = ha.locate(name)
+    if folder is None:
+        return None
+    folder = Path(folder)
+    if not folder.is_dir():
+        return None
+    layout = ha.layout(ha.fleet())
+    if not _inside(folder, Path(layout.shared_root)):
+        return None
+    tree = _read_tree(folder)
+    return (folder.resolve(), tree) if tree is not None else None
+
+
+def _keep_overwritten(name: str, folder: Path, tree: Snapshot, session_id: str) -> Path | None:
+    """Save *tree* under <state dir>/overwritten/ when the live folder no longer holds it."""
+    live = _read_tree(folder) if folder.is_dir() else {}
+    if live == tree:
+        return None
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    dest = Path(ha.state_dir()) / OVERWRITTEN_DIR / f"{stamp}-{name}"
+    for rel, data in tree.items():
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    (dest / ".commons-overwritten.json").write_text(
+        json.dumps({"skill": name, "folder": str(folder), "session": session_id, "saved": stamp}) + "\n",
+        encoding="utf-8",
+    )
+    log.warning(
+        "commons: %s changed again before its commit; the version written by session %s is kept in %s",
+        name,
+        session_id or "none",
+        dest,
+    )
+    return dest
+
+
+def _commit_skill(action: str, name: str, session_id: str, snap: tuple[Path, Snapshot] | None = None) -> None:
+    if snap is not None:
+        _keep_overwritten(name, snap[0], snap[1], session_id)
     profiles = ha.fleet()
     layout = ha.layout(profiles)
     folder = ha.locate(name)
@@ -177,10 +253,15 @@ def on_skill_lifecycle(action: str | None = None, skill_name: str | None = None,
         if action not in COMMIT_ACTIONS or not skill_name:
             return
         session_id = str(kw.get("session_id") or "")
+        snap = None
+        try:
+            snap = _snapshot(skill_name)
+        except Exception as exc:  # noqa: BLE001 - a hook must never raise
+            log.warning("commons: could not copy %s before its commit: %s", skill_name, exc)
 
         def job() -> None:
             try:
-                _commit_skill(action, skill_name, session_id)
+                _commit_skill(action, skill_name, session_id, snap)
             except Exception as exc:  # noqa: BLE001 - a hook must never raise
                 log.warning("commons: could not commit %s %s: %s", action, skill_name, exc)
 

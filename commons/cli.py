@@ -44,6 +44,7 @@ from typing import Any, TextIO
 
 from commons import hermes_adapter as ha
 from commons.core import check as check_mod
+from commons.core import consistency as cons
 from commons.core import history, merge
 from commons.core import promote as promote_mod
 from commons.core import restore as restore_mod
@@ -108,7 +109,22 @@ def setup_fn(parser: argparse.ArgumentParser) -> None:
     p.add_argument("--apply", action="store_true", help="carry out the saved proposal")
     p.add_argument("--resume", metavar="ID", help="finish an interrupted apply")
     p.add_argument("--schedule", action="store_true", help="create the hourly script-only check")
+    p.add_argument(
+        "--lock",
+        choices=cons.LOCK_LEVELS,
+        help="consistency lock for a first setup (default shared; an existing setting is kept)",
+    )
     p.add_argument("--yes", action="store_true")
+
+    p = sub.add_parser("config", help="show or change the consistency settings (lock, guard)")
+    csub = p.add_subparsers(dest="config_command", metavar="ACTION")
+    csub.add_parser("show", help="print the settings (the default)")
+    q = csub.add_parser(
+        "set", help="lock own|shared, guard off|warn|strict, or guard.<profile> <level>|unset"
+    )
+    q.add_argument("key", metavar="KEY")
+    q.add_argument("value", metavar="VALUE")
+    q.add_argument("--yes", action="store_true")
 
     p = sub.add_parser("status", help="where every skill of every profile comes from")
     p.add_argument("--only", metavar="PROFILE", help="show one profile")
@@ -364,7 +380,33 @@ def _setup_apply(args: argparse.Namespace, out: TextIO, err: TextIO, resume: str
         out.write(f"undo it with `hermes commons restore {result.backup_id}`\n")
         return 1
     out.write("verify: no problems\n")
+    if resume is None:
+        _first_setup_lock(args, out, err, result.backup_id)
     return _offer_schedule(args, out, err)
+
+
+def _first_setup_lock(args: argparse.Namespace, out: TextIO, err: TextIO, backup_id: str | None) -> None:
+    """A first setup gets lock shared (or --lock); an install that already has settings keeps them."""
+    state = Path(ha.state_dir())
+    current = cons.read_settings(state)
+    if current.exists:
+        out.write(f"consistency: lock {current.lock}, guard {current.guard} (kept)\n")
+        return
+    lock = getattr(args, "lock", None) or "shared"
+    try:
+        res = cons.switch_locks(ha.fleet(), state, lock)
+    except (cons.ConsistencyError, OSError) as exc:
+        err.write(
+            f"commons: lock {lock} not set ({exc}); set it later with `hermes commons config set lock {lock}`\n"
+        )
+        cons.write_settings(state, cons.Settings(lock="own"))
+        return
+    cons.write_settings(state, cons.Settings(lock=lock))
+    if backup_id:
+        cons.record_setup(state, backup_id, res.backup)
+    out.write(f"consistency: lock {lock}, guard off (change with `hermes commons config set`)\n")
+    if res.backup is not None:
+        out.write(f"  the profiles' old .locks folders are in {res.backup}\n")
 
 
 # ------------------------------------------------------------------ scheduled check (5.5)
@@ -468,6 +510,84 @@ def _offer_schedule(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ config (consistency)
+
+GUARD_RESTART = (
+    "the guard's hooks load when Hermes starts: restart the gateway and any open chats"
+    " (`hermes gateway restart`) for {who} to start checking writes"
+)
+
+
+def render_settings(settings: cons.Settings) -> list[str]:
+    lines = [f"lock: {settings.lock}", f"guard: {settings.guard}"]
+    lines += [f"guard.{p}: {lvl}" for p, lvl in sorted(settings.guard_overrides.items())]
+    if not settings.exists:
+        lines.append("(no consistency.json: the defaults, the same as commons 0.1)")
+    lines += [f"problem: {x}" for x in settings.problems]
+    return lines
+
+
+def cmd_config(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    state = Path(ha.state_dir())
+    current = cons.read_settings(state)
+    if getattr(args, "config_command", None) in (None, "show"):
+        out.writelines(f"{line}\n" for line in render_settings(current))
+        return 0
+    key, value = args.key, args.value
+    profiles = ha.fleet()
+    if key == "lock":
+        if value not in cons.LOCK_LEVELS:
+            err.write(f"commons: lock must be one of {', '.join(cons.LOCK_LEVELS)}\n")
+            return 2
+        plan = [cons.link_state(p) for p in profiles]
+        target = {p.name: cons.lock_target(state, p.name, value) for p in profiles}
+        out.write(f"set lock {value}: point every profile's skills/.locks at {cons.locks_root(state)}\n")
+        out.writelines(f"  {s_.profile}: {s_.path} -> {target[s_.profile]}\n" for s_ in plan)
+        out.write("  real .locks folders are moved into a backup (nothing is deleted)\n")
+        code = _asked("Change it?", args, out, err)
+        if code is not None:
+            return code
+        res = cons.switch_locks(profiles, state, value)
+        new = cons.Settings(value, current.guard, dict(current.guard_overrides), exists=True)
+        cons.write_settings(state, new)
+        out.write(f"lock is now {value} (linked: {', '.join(res.linked) or 'none'})\n")
+        if res.backup is not None:
+            out.write(f"the old .locks folders are in {res.backup}\n")
+        out.write("it takes effect on the next skill write; a write already running may overlap once\n")
+        return 0
+    overrides = dict(current.guard_overrides)
+    if key == "guard":
+        if value not in cons.GUARD_LEVELS:
+            err.write(f"commons: guard must be one of {', '.join(cons.GUARD_LEVELS)}\n")
+            return 2
+        new = cons.Settings(current.lock, value, overrides, exists=True)
+        who = "every profile"
+    elif key.startswith("guard."):
+        name = key.split(".", 1)[1]
+        _profile(profiles, name)
+        if value == "unset":
+            overrides.pop(name, None)
+        elif value in cons.GUARD_LEVELS:
+            overrides[name] = value
+        else:
+            err.write(f"commons: guard.{name} must be one of {', '.join(cons.GUARD_LEVELS)} or unset\n")
+            return 2
+        new = cons.Settings(current.lock, current.guard, overrides, exists=True)
+        who = name
+    else:
+        err.write("commons: KEY is lock, guard or guard.<profile>\n")
+        return 2
+    out.write(f"set {key} {value} in {cons.settings_path(state)}\n")
+    code = _asked("Change it?", args, out, err)
+    if code is not None:
+        return code
+    cons.write_settings(state, new)
+    out.writelines(f"{line}\n" for line in render_settings(cons.read_settings(state)))
+    if new.guard_anywhere() and not current.guard_anywhere():
+        out.write(GUARD_RESTART.format(who=who) + "\n")
+    return 0
+
+
 # ------------------------------------------------------------------ status, check
 
 
@@ -478,7 +598,28 @@ def cmd_status(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         _profile(profiles, only)
     report = status(profiles, ha.md5_dir_hash, ha.hub_hash)
     out.write(render_status(report, profile=only, skill=getattr(args, "skill", None)))
+    if getattr(args, "skill", None) is None:
+        out.write(_consistency_line(profiles) + "\n")
     return 0
+
+
+def _consistency_line(profiles: Sequence[Profile]) -> str:
+    settings = cons.read_settings(Path(ha.state_dir()))
+    line = f"consistency: lock {settings.lock}, guard {settings.guard}"
+    if settings.guard_overrides:
+        line += " (" + ", ".join(f"{p} {v}" for p, v in sorted(settings.guard_overrides.items())) + ")"
+    if settings.lock == "own":
+        try:
+            near = check_mod.near_collisions(ha.layout(profiles))
+        except (GitError, OSError, ValueError):
+            near = []
+        if near:
+            line += (
+                f"\n  {len(near)} time(s) two profiles edited the same skill within a minute"
+                " (last 30 days); `hermes commons config set lock shared` makes such writes wait"
+                " for each other"
+            )
+    return line
 
 
 def cmd_check(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
@@ -741,15 +882,22 @@ def cmd_restore(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         steps = [
             (plan.backup_id, restore_mod.restore(plan, profiles, _writer(), copy_new_to=copy_to or None))
         ]
+    record = cons.setup_record(Path(layout.state_dir)) or {}
     for bid, res in steps:
         out.write(f"restored {bid} (a pre-restore backup is {res.pre_restore_backup_id})\n")
         _lines(out, "done", res.done)
         _lines(out, "reports", res.reports)
+        if bid == record.get("setup"):
+            back = cons.undo_setup_lock(profiles, Path(layout.state_dir))
+            out.write(
+                f"consistency: each profile's own skills/.locks put back ({', '.join(back) or 'none'})\n"
+            )
     return 0
 
 
 COMMANDS: dict[str, Callable[[argparse.Namespace, TextIO, TextIO], int]] = {
     "setup": cmd_setup,
+    "config": cmd_config,
     "status": cmd_status,
     "check": cmd_check,
     "promote": cmd_promote,

@@ -25,6 +25,16 @@ run_check() reads, never writes. Findings, by code:
                              is no longer the origin hash recorded at take-over
   stale-override       warn  an intentional_overrides entry whose profile has
                              no local copy of that skill
+  locks-unshared       warn  consistency lock is shared but a profile's
+                             skills/.locks is not a link to the shared lock folder
+  locks-mismatch       warn  consistency lock is own but a profile's .locks
+                             links somewhere other than its own lock folder
+  consistency-config   warn  consistency.json cannot be read or has a bad value
+  guard-override       info  a profile runs the guard at another level than
+                             the fleet (consistency guard_overrides)
+  overwritten          warn  a skill version written through the skill tool
+                             was replaced before git committed it; the copy
+                             is in <state dir>/overwritten/
   unfinished-apply     warn  a journal in the state dir is neither complete nor
                              restored (setup or any Phase 4 operation); only
                              a setup journal can be resumed
@@ -52,13 +62,16 @@ journal.operation (lock, backup, journal). Stdlib + PyYAML only.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 
+from commons.core import consistency as cons
 from commons.core.apply import PROPOSAL_FILE, intents, unfinished_setups
 from commons.core.frontmatter import frontmatter_block
 from commons.core.gitrepo import GitError, GitRepo
@@ -164,6 +177,75 @@ def _git_findings(layout: Layout) -> list[Finding]:
         return []
     paths = ", ".join(line[3:] for line in lines[:5]) + (" ..." if len(lines) > 5 else "")
     return [_warn("uncommitted", None, None, f"{len(lines)} uncommitted changes in the shared root: {paths}")]
+
+
+# ------------------------------------------------------------------ consistency
+
+
+def _consistency_findings(profiles: Sequence, layout: Layout) -> list[Finding]:
+    state = Path(layout.state_dir)
+    settings = cons.read_settings(state)
+    found = [_warn("consistency-config", None, None, msg) for msg in settings.problems]
+    found += [
+        _warn(code, prof, None, msg) for code, prof, msg in cons.lock_findings(profiles, state, settings)
+    ]
+    for prof, level in sorted(settings.guard_overrides.items()):
+        if level != settings.guard:
+            found.append(
+                _info(
+                    "guard-override",
+                    prof,
+                    None,
+                    f"the guard runs at {level} here and at {settings.guard} for the other profiles",
+                )
+            )
+    kept = state / OVERWRITTEN_DIR
+    if kept.is_dir():
+        for d in sorted(kept.iterdir()):
+            if d.is_dir():
+                found.append(
+                    _warn(
+                        "overwritten",
+                        None,
+                        d.name.split("-", 1)[-1],
+                        f"a written version was replaced before its commit; it is kept in {d}"
+                        " (compare it with the live skill, then move the folder away)",
+                    )
+                )
+    return found
+
+
+OVERWRITTEN_DIR = "overwritten"
+_COMMIT_SUBJECT = re.compile(r"^\S+ (?P<skill>\S+) \(profile (?P<profile>[^,]+), session ")
+
+
+def near_collisions(
+    layout: Layout, window_s: float = 60.0, days: int = 30, n: int = 2000
+) -> list[tuple[str, str]]:
+    """(skill, date) for each time two different profiles' skill-edit commits landed within *window_s*.
+
+    Read-only, from the commit subjects the lifecycle hook writes; the hint
+    `status` shows while lock is own.
+    """
+    repo = GitRepo(layout.shared_root)
+    if not repo.is_repo():
+        return []
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    last: dict[str, tuple[datetime, str]] = {}
+    hits: list[tuple[str, str]] = []
+    for _sha, date, subject in reversed(repo.log(n=n)):
+        m = _COMMIT_SUBJECT.match(subject)
+        if m is None:
+            continue
+        when = datetime.fromisoformat(date)
+        if when < cutoff:
+            continue
+        skill, prof = m["skill"], m["profile"]
+        prev = last.get(skill)
+        if prev is not None and prev[1] != prof and (when - prev[0]).total_seconds() <= window_s:
+            hits.append((skill, date))
+        last[skill] = (when, prof)
+    return hits
 
 
 # ------------------------------------------------------------------ stale paths
@@ -377,6 +459,7 @@ def run_check(
     found += _skill_findings(Path(layout.shared_root), copies)
     found += _upstream_findings(profiles, config, bundled_index)
     found += _override_findings(profiles, config.get("intentional_overrides", []))
+    found += _consistency_findings(profiles, layout)
     for bid in unfinished_setups(layout):
         found.append(
             _warn(

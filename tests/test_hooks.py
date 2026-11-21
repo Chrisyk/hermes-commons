@@ -368,3 +368,55 @@ def test_hook_does_not_commit_while_a_journal_is_unfinished(wired, caplog):
     assert any(
         "did not finish" in r.getMessage() and "not committed" in r.getMessage() for r in caplog.records
     )
+
+
+# ------------------------------------------------------------------ lock shared: in-lock snapshot
+
+
+def _use_guard_state(monkeypatch, settings):
+    from commons import guard
+    from commons.core import consistency as cons
+
+    state = guard._State()
+    monkeypatch.setattr(guard, "STATE", state)
+    monkeypatch.setattr(guard, "cached_settings", lambda: cons.Settings(lock=settings))
+
+
+def test_lock_shared_keeps_a_version_replaced_before_its_commit(wired, monkeypatch):
+    _use_guard_state(monkeypatch, "shared")
+    shared = wired["shared"]
+    gate = threading.Event()
+    real = hooks._commit_skill
+
+    def slow(*a, **k):
+        gate.wait(10)
+        return real(*a, **k)
+
+    monkeypatch.setattr(hooks, "_commit_skill", slow)
+    _edit(shared, "written by A")
+    hooks.on_skill_lifecycle(action="patched", skill_name="foo", session_id="A", provenance="local")
+    md = shared / "general" / "foo" / "SKILL.md"
+    md.write_text(md.read_text(encoding="utf-8").replace("written by A", "B overwrote it"), encoding="utf-8")
+    gate.set()
+    assert wired["worker"].flush(10)
+    kept = list((wired["layout"].state_dir / "overwritten").iterdir())
+    assert len(kept) == 1 and kept[0].name.endswith("-foo")
+    assert "written by A" in (kept[0] / "SKILL.md").read_text(encoding="utf-8")
+    meta = json.loads((kept[0] / ".commons-overwritten.json").read_text(encoding="utf-8"))
+    assert meta["session"] == "A"
+
+
+def test_lock_shared_keeps_nothing_when_the_folder_is_unchanged(wired, monkeypatch):
+    _use_guard_state(monkeypatch, "shared")
+    _edit(wired["shared"], "fine")
+    hooks.on_skill_lifecycle(action="patched", skill_name="foo", session_id="A", provenance="local")
+    assert wired["worker"].flush(10)
+    assert not (wired["layout"].state_dir / "overwritten").exists()
+
+
+def test_lock_own_takes_no_snapshot(wired, monkeypatch):
+    _use_guard_state(monkeypatch, "own")
+    monkeypatch.setattr(hooks, "_read_tree", lambda *a, **k: pytest.fail("no copy with lock own"))
+    _edit(wired["shared"], "x")
+    hooks.on_skill_lifecycle(action="patched", skill_name="foo", session_id="A", provenance="local")
+    assert wired["worker"].flush(10)

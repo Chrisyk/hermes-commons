@@ -9,7 +9,7 @@
 [![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-0.23%2B-purple?style=flat-square)](https://github.com/NousResearch/hermes-agent)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
 
-[Install](#install) · [What it does](#what-it-does) · [Guild vs commons](#how-it-differs-from-guild) · [Disclosure](#what-it-touches-disclosure)
+[Install](#install) · [What it does](#what-it-does) · [Consistency](#several-agents-writing-one-skill) · [Upgrading](#upgrading) · [Guild vs commons](#how-it-differs-from-guild) · [Disclosure](#what-it-touches-disclosure)
 
 <img src="docs/assets/demo.gif" alt="commons setup scanning four profiles, printing a merge proposal, applying it with a backup, committing an agent's skill edit to git and catching a shadowed copy with check" width="800">
 
@@ -68,6 +68,43 @@ charts.
   demote. It works step by step from a write-ahead journal, so a crash at any point can be
   undone, and it keeps edits you made after the operation.
 
+## Several agents writing one skill
+
+Hermes locks a skill while one profile writes it, but each profile uses its
+own lock folder, so two profiles writing the same shared skill at once can
+lose an edit. An agent can also rewrite a skill from a copy it read minutes
+ago. Two settings handle this; you choose how much consistency to trade for
+speed:
+
+```
+hermes commons config set lock shared    # one lock for every profile (own = Hermes' default)
+hermes commons config set guard warn     # off | warn | strict: catch writes based on an old read
+```
+
+- `lock shared` reuses Hermes' own lock, so a write waits only while another
+  profile writes the same skill. With it on, a version replaced before its
+  commit is kept and reported.
+- `guard strict` refuses a stale write and tells the agent to re-read and
+  re-apply; `warn` only logs it. The guard can differ per profile
+  (`guard.<profile>`).
+
+A new setup uses `lock shared`; existing installs keep `lock own` and
+`guard off` until you change them. Details and limits:
+[docs/consistency.md](docs/consistency.md).
+
+## Upgrading
+
+```
+hermes plugins update commons
+hermes commons config set lock shared    # optional, recommended
+hermes commons check
+```
+
+An update changes no setting. Restart the gateway and open chats after
+updating (and after turning the guard on) so they load the new code. If
+`update` says the plugin is pinned, reinstall it:
+`hermes plugins install Chrisyk/hermes-commons --enable`.
+
 ## How it differs from Guild
 
 [Guild](https://github.com/Nnadijoshuac/hermes-guild) is a team library: skills are proposed,
@@ -101,6 +138,10 @@ Setup can also add an hourly `hermes commons check --fix-safe --quiet` cron job
 
 - Reads every profile's `config.yaml`, skills folders, bundled manifest, hub lock and cron
   `jobs.json`.
+- With `lock shared`: replaces each profile's `skills/.locks` folder with a symlink to
+  `<hermes home>/commons/skill-locks/` (the old folder is moved into a backup).
+- With the guard on: reads the skill and shared-folder files your agents view or write, to
+  compare versions, and logs refusals to `<hermes home>/commons/guard.log`.
 - On apply and the other writing commands, after asking: writes the shared skills folder,
   runs local `git` in it (hooks disabled, no prompts, 30 s timeout), sets `skills.create_dir`
   and adds `commons` to `plugins.enabled` through `hermes config set`, moves replaced skill
@@ -112,9 +153,10 @@ Setup can also add an hourly `hermes commons check --fix-safe --quiet` cron job
 
 ## Limitations
 
-- The per-edit hook only sees edits made through Hermes' skill tool. Files edited by hand or
-  by shell commands are caught by `check` (uncommitted) and committed by `check --fix-safe`.
-- Windows hosts are untested.
+- The per-edit hook and the guard only see edits made through Hermes' tools. Files edited by
+  hand or by shell commands are caught by `check` (uncommitted) and committed by
+  `check --fix-safe`.
+- Windows hosts are not supported (commons needs `fcntl`).
 - Containment ignores trailing whitespace, CRLF versus LF, and a newer `version:` line in the
   copy being retired. Anything else, including line order, counts as a difference.
 
