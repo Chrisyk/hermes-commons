@@ -103,7 +103,7 @@ hermes commons check
 An update changes no setting. Restart the gateway and open chats after
 updating (and after turning the guard on) so they load the new code. If
 `update` says the plugin is pinned, reinstall it:
-`hermes plugins install Chrisyk/hermes-commons --enable`.
+`hermes plugins install Chrisyk/hermes-commons --enable --force`.
 
 ## How it differs from Guild
 
