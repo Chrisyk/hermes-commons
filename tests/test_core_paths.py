@@ -118,6 +118,7 @@ def test_component_boundaries(setup, tmp_path):
     assert [f.old for f in found] == [f"{old}/SKILL.md", str(old)]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the test builds POSIX-style mixed-separator path strings")
 def test_foo_never_matches_inside_foobar(tmp_path):
     a = tmp_path / "a" / "skills"
     write_files(tmp_path / "new" / "foo", {"SKILL.md": "x\n"})
