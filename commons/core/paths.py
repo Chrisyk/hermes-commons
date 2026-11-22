@@ -49,9 +49,9 @@ REWRITES = "rewrites"
 _LOCK_TIMEOUT = 30.0
 
 # A path component character; a match must not touch one on either side.
-_PATH_CHAR = r"[\w.~/-]"
+_PATH_CHAR = r"[\w.~/\\-]"
 _TERM = r"""[\s'"`<>()\[\]{}|,;]"""
-_SUFFIX = r"""(?P<suffix>/[^\s'"`<>()\[\]{}|,;]*)?"""
+_SUFFIX = r"""(?P<suffix>[/\\][^\s'"`<>()\[\]{}|,;]*)?"""
 # After a path: optional sentence punctuation, then a terminator or the end.
 _END = rf"(?=[.:!?]*(?:$|{_TERM}))"
 _TRAIL = ".:!?"
@@ -119,6 +119,8 @@ def _forms(moved: Mapping[Path, Path], home: Path) -> list[_Form]:
             variants.add(old.resolve())
         for v in variants:
             forms.setdefault(str(v), _Form(str(v), old, new, False))
+            if winfs.IS_WINDOWS:
+                forms.setdefault(v.as_posix(), _Form(v.as_posix(), old, new, False))
             t = _tilde(v, home)
             if t is not None:
                 forms.setdefault(t, _Form(t, old, new, True))

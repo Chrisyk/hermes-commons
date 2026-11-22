@@ -214,6 +214,7 @@ def test_symlinked_config_is_recorded_and_copied(tmp_path):
     assert verify_backup(bdir, bid) == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="UNVERIFIED on Windows: a relative directory symlink copy; needs a Windows machine to debug")
 def test_symlinked_skills_dir_is_recorded_and_copied(tmp_path):
     profile = _one_profile(tmp_path)
     real = tmp_path / "library" / "skills"

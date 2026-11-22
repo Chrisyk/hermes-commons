@@ -470,7 +470,18 @@ def test_exists_at(repo):
         repo.exists_at("main", "a")
 
 
-@pytest.mark.parametrize("first", [False, True])
+@pytest.mark.parametrize(
+    "first",
+    [
+        pytest.param(
+            False,
+            marks=pytest.mark.skipif(
+                sys.platform == "win32", reason="UNVERIFIED on Windows: git rm --cached with a literal pathspec"
+            ),
+        ),
+        True,
+    ],
+)
 def test_commit_all_exclude_never_commits_excluded_paths(repo, first):
     if first:
         _write(repo.path / "base.txt", "b\n")

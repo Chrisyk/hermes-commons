@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -160,6 +161,7 @@ def test_bundled_edited_identical_copies_move_and_are_taken_over(fleet):
     }
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the test builds POSIX-style mixed-separator path strings")
 def test_cron_rewrites_only_for_existing_files(classic_fleet):
     old = classic_fleet / "profiles" / "pikvm" / "skills" / "general" / "contained"
     jobs = {

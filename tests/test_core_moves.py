@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from commons.core import moves
+from commons.core import moves, winfs
 from commons.core.backup import tree_sha256
 from commons.core.moves import RetireError, move_noreplace, retire
 
@@ -82,7 +82,7 @@ def test_symlinked_skill_moves_as_link(tmp_path):
     link.symlink_to(real, target_is_directory=True)
     dest = retire(link, tmp_path / "backup", "default", "general/linked")
     assert dest.is_symlink()
-    assert os.readlink(dest) == str(real)
+    assert winfs.read_link(dest) == str(real)
     assert not link.exists() and not link.is_symlink()
     assert real.is_dir() and tree_sha256(real) == before
 
@@ -120,7 +120,7 @@ def test_cross_filesystem_symlink(tmp_path, monkeypatch):
     link.symlink_to(real, target_is_directory=True)
     _cross_device(monkeypatch, link)
     dest = retire(link, tmp_path / "backup", "p", "linked")
-    assert dest.is_symlink() and os.readlink(dest) == str(real)
+    assert dest.is_symlink() and winfs.read_link(dest) == str(real)
     assert not link.is_symlink()
     assert (real / "SKILL.md").is_file()
 
@@ -217,7 +217,7 @@ def test_cross_filesystem_fsyncs_copy_before_rename_and_removal(tmp_path, monkey
     real_fsync, real_rmtree = os.fsync, moves.shutil.rmtree
 
     def spy_fsync(fd):
-        events.append(("fsync", os.readlink(f"/proc/self/fd/{fd}")))
+        events.append(("fsync", winfs.read_link(f"/proc/self/fd/{fd}")))
         return real_fsync(fd)
 
     def spy_rmtree(path, *args, **kwargs):

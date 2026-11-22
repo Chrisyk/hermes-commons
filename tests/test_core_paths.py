@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,7 @@ def setup(classic_fleet, tmp_path):
     return classic_fleet, shared, moved
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the test builds POSIX-style mixed-separator path strings")
 def test_cron_prompt_and_reference_file(setup, tmp_path):
     root, shared, moved = setup
     old = root / "skills" / "general" / "same"
@@ -147,6 +149,7 @@ def test_exists_hook_and_missing_cron_path(setup, tmp_path):
     assert done == [] and skipped == real
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the test builds POSIX-style mixed-separator path strings")
 def test_rewrite_keeps_mode_and_bare_list_shape(setup, tmp_path):
     root, shared, moved = setup
     old = root / "skills" / "general" / "same"
