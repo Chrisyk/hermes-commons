@@ -35,6 +35,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 import yaml
 from yaml.constructor import ConstructorError
 
+from commons.core import winfs
 from commons.core.fleet import CONFIG_FILE, DEFAULT_PROFILE, Profile
 from commons.core.frontmatter import UniqueKeyLoader
 from commons.core.yamledit import Lines, Unsupported
@@ -257,17 +258,13 @@ class YamlFileWriter:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.chmod(tmp, mode)
-            os.replace(tmp, path)
+            winfs.replace_retry(tmp, path)
         except BaseException:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp)
             raise
         # Make the rename itself durable.
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        winfs.fsync_path(path.parent)
 
     def get(self, profile: Profile, key: str) -> Any:
         return _lookup(self._load(profile), _parts(key))

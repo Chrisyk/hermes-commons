@@ -204,7 +204,7 @@ def write_json_atomic(path: Path, data: dict) -> None:
         fh.write(json_bytes(data))
         fh.flush()
         os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    winfs.replace_retry(tmp, path)
     _fsync_path(path.parent)
 
 

@@ -148,7 +148,7 @@ def write_settings(state_dir: Path, settings: Settings) -> Path:
         fh.write(json.dumps(settings.to_json(), indent=2, sort_keys=True) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    winfs.replace_retry(tmp, path)
     return path
 
 
