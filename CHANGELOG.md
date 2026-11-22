@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-22)
 
 - Windows support. File locks go through `commons/core/filelock.py`
   (`fcntl` on POSIX, `msvcrt` on Windows); `lock shared` uses a directory
