@@ -31,13 +31,12 @@ the switch keeps that inode, so one write in flight can still overlap one
 write that starts on the new link; the docs say so. Moved directories go
 into <state dir>/backups/consistency-<stamp>/ (nothing is deleted).
 
-Stdlib only. Linux and macOS (fcntl).
+Stdlib only. Linux, macOS and Windows.
 """
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import shutil
@@ -47,6 +46,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from commons.core import filelock
 from commons.core.fleet import Profile
 
 SETTINGS_FILE = "consistency.json"
@@ -230,17 +230,17 @@ def busy_locks(dirs: Iterable[Path]) -> list[Path]:
                 if not entry.is_file() or entry.is_symlink():
                     continue
                 try:
-                    fd = os.open(entry, os.O_RDONLY)
+                    # Windows needs write access to take a byte lock; POSIX flock does not.
+                    fd = os.open(entry, (os.O_RDWR if filelock.IS_WINDOWS else os.O_RDONLY) | filelock.O_BINARY)
                 except OSError:
                     continue
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    held.append(entry)
+                    if filelock.try_lock(fd, 0):
+                        filelock.unlock(fd, 0)
+                    else:
+                        held.append(entry)
                 except OSError:
                     pass
-                else:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
                 finally:
                     os.close(fd)
     return held

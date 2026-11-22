@@ -24,7 +24,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -39,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
+from commons.core import filelock
 from commons.core.fleet import Profile
 
 PROMPT_FIELDS = ("prompt",)
@@ -280,21 +280,18 @@ def write_atomic(path: Path, data: bytes) -> None:
 def cron_lock(jobs_path: Path, timeout: float = _LOCK_TIMEOUT) -> Iterator[None]:
     """Hold Hermes' cross-process cron lock, <cron dir>/.jobs.lock (cron/jobs.py _jobs_lock)."""
     lock = Path(jobs_path).parent / JOBS_LOCK
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | filelock.O_BINARY, 0o600)
     try:
         deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"could not lock {lock} within {timeout} s") from None
-                time.sleep(0.05)
+        # Offset 0: Hermes' own cron lock takes byte 0 on Windows, so ours must match.
+        while not filelock.try_lock(fd, 0):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"could not lock {lock} within {timeout} s") from None
+            time.sleep(0.05)
         try:
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            filelock.unlock(fd, 0)
     finally:
         os.close(fd)
 
