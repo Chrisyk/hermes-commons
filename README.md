@@ -119,7 +119,7 @@ transport.
 
 ## Install
 
-Requires Hermes 0.23.0 or later, Linux or macOS, and `git`.
+Requires Hermes 0.23.0 or later, Linux, macOS or Windows, and `git`.
 
 ```
 hermes plugins install Chrisyk/hermes-commons --enable
@@ -160,7 +160,10 @@ Setup can also add an hourly `hermes commons check --fix-safe --quiet` cron job
 - The per-edit hook and the guard only see edits made through Hermes' tools. Files edited by
   hand or by shell commands are caught by `check` (uncommitted) and committed by
   `check --fix-safe`.
-- Windows hosts are not supported (commons needs `fcntl`).
+- Windows is supported. It is tested in CI on a Windows runner but has had less
+  real-world use than Linux. The scheduled check is written as
+  `commons-check.py` there (Hermes runs `.py` cron scripts with its own Python).
+  See [docs/consistency.md](docs/consistency.md) for the differences.
 - Containment ignores trailing whitespace, CRLF versus LF, and a newer `version:` line in the
   copy being retired. Anything else, including line order, counts as a difference.
 

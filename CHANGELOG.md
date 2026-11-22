@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Windows support. File locks go through `commons/core/filelock.py`
+  (`fcntl` on POSIX, `msvcrt` on Windows); `lock shared` uses a directory
+  junction on Windows; directory fsync, process-tree kill, backslash paths in
+  the stale-path check, git settings (`core.autocrlf=false`, `core.longpaths=true`)
+  and the scheduled check script are handled per platform (`commons/core/winfs.py`).
+  CI now runs on Ubuntu and Windows.
+
 ## 0.2.1 (2026-11-21)
 
 - Fix enabling commons in more than one profile: Hermes refused the second
