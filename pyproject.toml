@@ -3,7 +3,7 @@
 # hermes-commons and Hermes' `uv lock` refuses the environment.
 [project]
 name = "hermes-commons"
-version = "0.2.1"
+version = "0.3.0"
 description = "One live skill library for every Hermes profile."
 license = { text = "MIT" }
 authors = [{ name = "Christopher Ko" }]

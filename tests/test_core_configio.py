@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -194,12 +195,14 @@ def test_argv_option_like_value_follows_double_dash():
     assert argv.index("--") < argv.index("-x")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 def test_new_config_is_private(tmp_path):
     p = _profile(tmp_path)
     YamlFileWriter().set(p, "a", 1)
     assert stat.S_IMODE((p.home / "config.yaml").stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 def test_existing_config_keeps_its_mode(tmp_path):
     p = _profile(tmp_path, {"a": 1})
     (p.home / "config.yaml").chmod(0o640)

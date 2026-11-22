@@ -47,6 +47,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
+from commons.core import winfs
 from commons.core.fleet import DEFAULT_PROFILE
 from commons.core.scan import EXCLUDED_SKILL_DIRS, SKILL_FILE, SkillCopy
 
@@ -243,7 +244,7 @@ def _content(directory: Path) -> dict[str, _File]:
     out: dict[str, _File] = {}
     for rel, kind, full in sorted(_content_entries(os.fspath(directory))):
         if kind == "L":
-            target = os.readlink(full).encode("utf-8", "surrogateescape")
+            target = winfs.read_link(full).encode("utf-8", "surrogateescape")
             out[rel] = _File("link", False, digest=hashlib.sha256(target).hexdigest())
         elif kind == "D":
             out[rel] = _DIR

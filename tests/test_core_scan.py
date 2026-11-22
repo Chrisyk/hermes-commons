@@ -450,9 +450,11 @@ def test_unreadable_dirs_do_not_crash(classic_fleet, chmod_000):
 
 
 # A file name that is not valid UTF-8 (one raw 0xff byte), as os.walk returns it.
-_BAD = os.fsdecode(b"bad\xff.txt")
+_BAD = os.fsdecode(b"bad\xff.txt") if os.name != "nt" else "bad.txt"
+_NO_BAD_NAMES = pytest.mark.skipif(os.name == "nt", reason="Windows file names are always valid text")
 
 
+@_NO_BAD_NAMES
 def test_undecodable_filename_in_own_skill_is_hashed(classic_fleet):
     skill = classic_fleet / "skills" / "general" / "conflict"
     before = _by_rel(_scan(classic_fleet, "default"))["general/conflict"].tree_hash
@@ -465,6 +467,7 @@ def test_undecodable_filename_in_own_skill_is_hashed(classic_fleet):
     assert _by_rel(_scan(classic_fleet, "default"))["general/conflict"].tree_hash not in ("", copy.tree_hash)
 
 
+@_NO_BAD_NAMES
 def test_undecodable_filename_in_bundled_or_hub_copy_is_an_error(classic_fleet):
     skills = classic_fleet / "skills"
     for rel in ("bundled/bundled-pristine", "tools/hubskill"):

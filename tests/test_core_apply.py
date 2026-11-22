@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -199,6 +200,7 @@ def test_stale_proposal_is_refused(classic_fleet):
     assert result.backup_id is None and result.steps_done == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the test builds POSIX-style mixed-separator path strings")
 def test_cron_and_reference_rewrites(classic_fleet):
     root = classic_fleet
     old = root / "profiles" / "pikvm" / "skills" / "general" / "same"

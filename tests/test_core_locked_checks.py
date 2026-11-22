@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime
 
 import pytest
@@ -16,7 +17,7 @@ from tests.fleet import skill_md, write_files
 from tests.test_core_restore_ops import conflict_ready, set_up
 
 LATER = datetime(2026, 11, 20, 17, 0, 0, tzinfo=UTC)
-ODD_NAMES = ["日本語 スキル", "a [b] c*", "plain name"]
+ODD_NAMES = ["日本語 スキル", "plain name"] if sys.platform == "win32" else ["日本語 スキル", "a [b] c*", "plain name"]
 
 
 def add_shared(lay, folder: str, name: str, lines: list[str]) -> str:
@@ -49,6 +50,7 @@ def test_log_undo_commit_with_odd_folder_names(classic_fleet, folder):
     assert GitRepo(lay.shared_root).status_porcelain() == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="* and [ are not allowed in Windows file names")
 def test_undo_dirty_check_sees_only_its_folder(classic_fleet):
     lay = set_up(classic_fleet)
     add_shared(lay, "a [b] c*", "odd", ["one"])
@@ -127,6 +129,7 @@ def test_retire_shared_rechecks_the_fingerprint_before_moving(classic_fleet):
     assert (src / "SKILL.md").read_text(encoding="utf-8") == "changed under us\n"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="* and [ are not allowed in Windows file names")
 def test_status_paths_is_not_quoted(tmp_path):
     repo = GitRepo(tmp_path)
     repo.init()

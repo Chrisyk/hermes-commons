@@ -60,7 +60,7 @@ from commons.core.report import render_status, status
 
 NEEDS_CONFIRMATION = "needs confirmation; rerun with --yes"
 SLASH_ALLOWED = ("status", "check")
-SCRIPT_NAME = "commons-check.sh"
+SCRIPT_NAME = "commons-check.py" if sys.platform == "win32" else "commons-check.sh"
 CRON_SCHEDULE = "0 * * * *"
 CRON_NAME = "commons hourly check"
 CRON_TIMEOUT = 60.0
@@ -413,6 +413,12 @@ def _first_setup_lock(args: argparse.Namespace, out: TextIO, err: TextIO, backup
 
 
 def check_script_text(command: Sequence[str]) -> str:
+    if sys.platform == "win32":
+        # Hermes runs .py cron scripts with its own Python (.sh needs Git Bash), so shell out from Python.
+        return (
+            "import subprocess, sys\n"
+            f"sys.exit(subprocess.call({list(command)!r}))\n"
+        )
     return f"#!/bin/sh\nexec {shlex.join(command)}\n"
 
 

@@ -1,6 +1,6 @@
 """A small locked wrapper around local git for the shared skill library.
 
-Every public operation that writes holds an exclusive fcntl.flock on
+Every public operation that writes holds an exclusive file lock (commons.core.filelock) on
 <path>/.commons/lock, so concurrent Hermes processes and threads (hooks, cron,
 setup, the gateway's profiles) never interleave git commands. Read-only calls
 (is_repo, status_porcelain, log) take no lock, create nothing and pass
@@ -12,16 +12,14 @@ Every git call disables hooks and commit signing, never prompts, runs with a
 timeout (the whole process group is killed on expiry), ignores GIT_DIR-style
 environment overrides, and falls back to the identity
 "commons <commons@localhost>" when no user.name / user.email is configured.
-Stdlib only. Linux and macOS.
+Stdlib only. Linux, macOS and Windows.
 """
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -30,6 +28,8 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from commons.core import filelock, winfs
+
 LOCK_DIR = ".commons"
 LOCK_NAME = "lock"
 DEFAULT_LOCK_TIMEOUT = 10.0
@@ -37,6 +37,8 @@ DEFAULT_GIT_TIMEOUT = 30.0
 FALLBACK_NAME = "commons"
 FALLBACK_EMAIL = "commons@localhost"
 _POLL_SECONDS = 0.05
+# Windows locks are mandatory: lock a far-away byte so the holder note at offset 0 stays readable.
+_LOCK_OFFSET = filelock.HIGH_OFFSET if filelock.IS_WINDOWS else 0
 # State commons keeps inside the library that must never be committed: the
 # lock and the folders backups, staging copies and retired skills live in.
 _EXCLUDE_LINES = (
@@ -154,7 +156,7 @@ class GitRepo:
                 with _held_guard:
                     entry[1] -= 1
             return
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | filelock.O_BINARY, 0o644)
         try:
             self._acquire(fd)
             self._write_holder(fd)
@@ -165,36 +167,33 @@ class GitRepo:
             finally:
                 with _held_guard:
                     del _held[key]
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                filelock.unlock(fd, _LOCK_OFFSET)
         finally:
             os.close(fd)
 
     def _acquire(self, fd: int) -> None:
         deadline = time.monotonic() + self.lock_timeout
         while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if filelock.try_lock(fd, _LOCK_OFFSET):
                 return
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise LockTimeout(
-                        f"could not lock {self.lock_path} within {self.lock_timeout} s; "
-                        f"held by {self._describe_holder(fd)}"
-                    ) from None
-                time.sleep(_POLL_SECONDS)
+            if time.monotonic() >= deadline:
+                raise LockTimeout(
+                    f"could not lock {self.lock_path} within {self.lock_timeout} s; "
+                    f"held by {self._describe_holder(fd)}"
+                ) from None
+            time.sleep(_POLL_SECONDS)
 
     @staticmethod
     def _write_holder(fd: int) -> None:
         """Record "<pid> <argv[0]>" in the lock file so a waiter can name the holder."""
         argv0 = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "python"
         data = f"{os.getpid()} {argv0}\n".encode()
-        os.ftruncate(fd, 0)
-        os.pwrite(fd, data, 0)
+        filelock.write_at_start(fd, data)
 
     @staticmethod
     def _describe_holder(fd: int) -> str:
         try:
-            text = os.pread(fd, 4096, 0).decode("utf-8", "replace").strip()
+            text = filelock.read_at_start(fd).decode("utf-8", "replace").strip()
         except OSError:
             text = ""
         if not text:
@@ -221,7 +220,20 @@ class GitRepo:
         cmd = [self.git_bin, "-C", str(self.path)]
         if read_only:
             cmd.append("--no-optional-locks")
-        cmd += ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+        hooks = "/dev/null"
+        if winfs.IS_WINDOWS:
+            # /dev/null may resolve to a real C:\\dev\\null a user can create: use a folder that never exists.
+            hooks = str(self.path / LOCK_DIR / "no-hooks")  # never created: git runs no hooks from a missing folder
+        cmd += [
+            "-c",
+            f"core.hooksPath={hooks}",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.longpaths=true",
+        ]
         if identity:
             cmd += self._fallback_identity()
         cmd += list(args)
@@ -235,8 +247,10 @@ class GitRepo:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=_git_env(),
-            start_new_session=True,
+            **winfs.popen_group_kwargs(),
         )
         try:
             stdout, stderr = proc.communicate(timeout=self.git_timeout)
@@ -256,8 +270,7 @@ class GitRepo:
 
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
+        winfs.kill_tree(proc)
         try:
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:

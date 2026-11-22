@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from commons.core import consistency as cons
+from commons.core import filelock
 from commons.core.fleet import discover
 
 
@@ -99,10 +99,13 @@ def test_own_on_a_fresh_install_touches_nothing(four):
 
 def test_a_held_lock_aborts_the_switch_and_changes_nothing(four):
     held = four["root"] / "profiles" / "device" / "skills" / ".locks" / "old.lock"
-    with open(held, "a+") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+    fd = os.open(held, os.O_RDWR | os.O_CREAT | filelock.O_BINARY)
+    try:
+        assert filelock.try_lock(fd, 0)
         with pytest.raises(cons.ConsistencyError, match="in progress"):
             cons.switch_locks(four["profiles"], four["state"], "shared")
+    finally:
+        os.close(fd)
     assert all(cons.link_state(p).kind == "dir" for p in four["profiles"])
 
 

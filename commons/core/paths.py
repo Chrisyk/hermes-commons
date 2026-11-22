@@ -24,7 +24,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -39,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
+from commons.core import filelock, winfs
 from commons.core.fleet import Profile
 
 PROMPT_FIELDS = ("prompt",)
@@ -49,9 +49,9 @@ REWRITES = "rewrites"
 _LOCK_TIMEOUT = 30.0
 
 # A path component character; a match must not touch one on either side.
-_PATH_CHAR = r"[\w.~/-]"
+_PATH_CHAR = r"[\w.~/\\-]"
 _TERM = r"""[\s'"`<>()\[\]{}|,;]"""
-_SUFFIX = r"""(?P<suffix>/[^\s'"`<>()\[\]{}|,;]*)?"""
+_SUFFIX = r"""(?P<suffix>[/\\][^\s'"`<>()\[\]{}|,;]*)?"""
 # After a path: optional sentence punctuation, then a terminator or the end.
 _END = rf"(?=[.:!?]*(?:$|{_TERM}))"
 _TRAIL = ".:!?"
@@ -119,6 +119,8 @@ def _forms(moved: Mapping[Path, Path], home: Path) -> list[_Form]:
             variants.add(old.resolve())
         for v in variants:
             forms.setdefault(str(v), _Form(str(v), old, new, False))
+            if winfs.IS_WINDOWS:
+                forms.setdefault(v.as_posix(), _Form(v.as_posix(), old, new, False))
             t = _tilde(v, home)
             if t is not None:
                 forms.setdefault(t, _Form(t, old, new, True))
@@ -247,11 +249,7 @@ def job_keys(jobs: list) -> list[str]:
 
 
 def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    winfs.fsync_path(path)
 
 
 def write_atomic(path: Path, data: bytes) -> None:
@@ -268,7 +266,7 @@ def write_atomic(path: Path, data: bytes) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, mode)
-        os.replace(tmp, target)
+        winfs.replace_retry(tmp, target)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
@@ -280,21 +278,18 @@ def write_atomic(path: Path, data: bytes) -> None:
 def cron_lock(jobs_path: Path, timeout: float = _LOCK_TIMEOUT) -> Iterator[None]:
     """Hold Hermes' cross-process cron lock, <cron dir>/.jobs.lock (cron/jobs.py _jobs_lock)."""
     lock = Path(jobs_path).parent / JOBS_LOCK
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | filelock.O_BINARY, 0o600)
     try:
         deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"could not lock {lock} within {timeout} s") from None
-                time.sleep(0.05)
+        # Offset 0: Hermes' own cron lock takes byte 0 on Windows, so ours must match.
+        while not filelock.try_lock(fd, 0):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"could not lock {lock} within {timeout} s") from None
+            time.sleep(0.05)
         try:
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            filelock.unlock(fd, 0)
     finally:
         os.close(fd)
 
@@ -325,7 +320,7 @@ def rewrite_backup_path(backup_dir: Path, finding: Finding) -> Path:
     if finding.kind == "cron":
         return Path(backup_dir) / REWRITES / "cron" / str(finding.profile) / JOBS_FILE
     assert finding.path is not None
-    return Path(backup_dir) / REWRITES / "files" / Path(finding.path).resolve().relative_to("/")
+    return Path(backup_dir) / REWRITES / "files" / winfs.relative_anchor(Path(finding.path).resolve())
 
 
 def _backup_once(src: Path, dest: Path) -> None:
@@ -334,8 +329,7 @@ def _backup_once(src: Path, dest: Path) -> None:
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
-    with open(dest, "rb") as fh:
-        os.fsync(fh.fileno())
+    winfs.fsync_path(dest)
     _fsync_dir(dest.parent)
 
 

@@ -62,7 +62,7 @@ def rewrite(env, text, session="A"):
     r = call("skill_manage", {"operations": [{"action": "patch", "name": SKILL, "content": text}]}, session)
     if isinstance(r, str):
         return r
-    env["md"].write_text(text, encoding="utf-8")  # what Hermes would do
+    env["md"].write_bytes(text.encode("utf-8"))  # what Hermes would do
     done("skill_manage", r[1])
     return None
 

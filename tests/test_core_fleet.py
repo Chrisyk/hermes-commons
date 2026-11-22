@@ -1,3 +1,7 @@
+import sys
+
+import pytest
+
 """Tests for commons.core.fleet discovery."""
 
 from pathlib import Path
@@ -37,6 +41,7 @@ def test_is_deleted_skips_profile(classic_fleet):
     assert names == ["default", "device", "pocket"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="expanduser reads USERPROFILE on Windows, not HOME")
 def test_create_dir_expands_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     p = Profile("x", tmp_path, {"skills": {"create_dir": "~/shared/skills"}})
@@ -50,6 +55,7 @@ def test_create_dir_none_when_unset_or_empty(tmp_path):
     assert Profile("x", tmp_path, {"skills": "oops"}).create_dir() is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="expanduser reads USERPROFILE on Windows, not HOME")
 def test_external_dirs_accepts_str_and_list(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     one = Profile("x", tmp_path, {"skills": {"external_dirs": "~/a"}})

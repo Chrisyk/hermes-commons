@@ -18,6 +18,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
+from commons.core import winfs
 from commons.core.backup import copy_tree, file_sha256, tree_sha256
 
 RETIRED = "retired"
@@ -74,6 +75,8 @@ def _rename_noreplace(src: Path, dest: Path) -> None:
 
 
 def _safe_parts(value: str, what: str) -> tuple[str, ...]:
+    if "\\" in value or (len(value) > 1 and value[1] == ":"):
+        raise ValueError(f"bad {what} {value!r}: must be a relative path inside the backup")
     pure = PurePosixPath(value)
     parts = pure.parts
     if not value or pure.is_absolute() or not parts or any(p in ("", ".", "..") for p in parts):
@@ -92,11 +95,7 @@ def _exists(path: Path) -> bool:
 
 
 def _fsync_path(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    winfs.fsync_path(path)
 
 
 def _mkdirs_durable(path: Path) -> None:
@@ -138,9 +137,9 @@ def _copy_then_remove(src: Path, dest: Path) -> None:
         raise FileExistsError(f"staging path {staging} already exists")
     try:
         if src.is_symlink():
-            staging.symlink_to(os.readlink(src))
+            staging.symlink_to(winfs.read_link(src))
             _fsync_path(dest.parent)
-            ok = os.readlink(staging) == os.readlink(src)
+            ok = winfs.read_link(staging) == winfs.read_link(src)
         elif src.is_dir():
             shutil.copytree(src, staging, symlinks=True)
             _fsync_tree(staging)

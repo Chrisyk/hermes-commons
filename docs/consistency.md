@@ -95,7 +95,13 @@ session and file, the version the session last read (or last wrote itself).
   cannot see them. `check` reports them as uncommitted and
   `check --fix-safe` commits them.
 - Profiles without commons enabled.
-- Windows (commons needs `fcntl`).
+- Windows is supported but only checked by CI on a Windows runner so far. Differences:
+  file locks use `msvcrt.locking` (the repo lock uses a byte far into the file so
+  the holder note stays readable; the cron lock uses byte 0 like Hermes); `lock shared`
+  links `skills/.locks` with a directory junction, which needs no admin rights
+  (it falls back to a real symlink, which needs Developer Mode or admin, if a
+  junction cannot be made); file modes and executable bits do not exist, so
+  `chmod` and the executable-bit checks have no effect.
 - A write that lands in the few milliseconds between the guard's check and
   Hermes taking its lock. Closing that needs Hermes to key its lock by the
   skill's real folder and accept an expected hash; that is an upstream

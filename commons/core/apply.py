@@ -75,7 +75,6 @@ import contextlib
 import copy
 import hashlib
 import json
-import os
 import shutil
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -83,6 +82,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from commons.core import winfs
 from commons.core.backup import (
     copy_tree,
     create_backup,
@@ -307,11 +307,7 @@ def _check_fresh(prop: Proposal, retired: Iterable[str] = ()) -> None:
 
 
 def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    winfs.fsync_path(path)
 
 
 def _commons_config_data(layout: Layout, prop: Proposal, profiles: Iterable[str]) -> dict[str, Any]:
@@ -420,8 +416,7 @@ class _RewriteHook:
         fresh = _next_free(write.backup)
         fresh.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(write.path, fresh)
-        with open(fresh, "rb") as fh:
-            os.fsync(fh.fileno())
+        winfs.fsync_path(fresh)
         _fsync_dir(fresh.parent)
         if file_sha256(fresh) != write.sha_before:
             raise ApplyError(f"{write.path} changed while it was being backed up; not rewritten")

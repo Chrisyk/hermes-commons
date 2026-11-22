@@ -89,7 +89,7 @@ def test_hub_hash_mirrors_hermes_content_hash(tmp_path):
     )
     assert ha.hub_hash(tmp_path / "s") == hub_content_hash(tmp_path / "s")
     one = tmp_path / "flat.md"
-    one.write_text("x\n", encoding="utf-8")
+    one.write_bytes(b"x\n")
     import hashlib
 
     assert ha.hub_hash(one) == "sha256:" + hashlib.sha256(b"x\n").hexdigest()[:16]
@@ -293,6 +293,7 @@ def test_writer_default_command_uses_hermes_command(monkeypatch, tmp_path):
         ha.HermesCliWriter(root=tmp_path).command(["x"])
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows folders are case-insensitive, so 'Dev' and 'dev' cannot both exist")
 def test_writer_refuses_a_name_hermes_would_casefold(tmp_path):
     w, runner, _ = _writer(tmp_path)
     home = tmp_path / "profiles" / "Dev"
