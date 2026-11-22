@@ -28,6 +28,7 @@ import stat
 from datetime import UTC, datetime
 from pathlib import Path
 
+from commons.core import winfs
 from commons.core.fleet import CONFIG_FILE, Profile
 from commons.core.layout import Layout, check_id, check_outside, skill_roots
 
@@ -54,6 +55,7 @@ def _walk(root: Path) -> list[tuple[str, Path]]:
     found: list[tuple[str, Path]] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         here = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not winfs.is_junction(here / d)] if winfs.IS_WINDOWS else dirnames
         for name in dirnames + filenames:
             p = here / name
             found.append((p.relative_to(root).as_posix(), p))
@@ -120,11 +122,7 @@ def file_sha256(path: Path) -> str | None:
 
 def _fsync_path(path: Path) -> None:
     """fsync a file or directory by path (directories make their entries durable)."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    winfs.fsync_path(path)
 
 
 def _mkdirs_durable(path: Path) -> None:

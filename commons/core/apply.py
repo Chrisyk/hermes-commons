@@ -83,6 +83,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from commons.core import winfs
 from commons.core.backup import (
     copy_tree,
     create_backup,
@@ -307,11 +308,7 @@ def _check_fresh(prop: Proposal, retired: Iterable[str] = ()) -> None:
 
 
 def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    winfs.fsync_path(path)
 
 
 def _commons_config_data(layout: Layout, prop: Proposal, profiles: Iterable[str]) -> dict[str, Any]:

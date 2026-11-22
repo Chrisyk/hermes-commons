@@ -20,7 +20,6 @@ from __future__ import annotations
 import contextlib
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -29,7 +28,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from commons.core import filelock
+from commons.core import filelock, winfs
 
 LOCK_DIR = ".commons"
 LOCK_NAME = "lock"
@@ -221,7 +220,22 @@ class GitRepo:
         cmd = [self.git_bin, "-C", str(self.path)]
         if read_only:
             cmd.append("--no-optional-locks")
-        cmd += ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+        hooks = "/dev/null"
+        if winfs.IS_WINDOWS:
+            # /dev/null may resolve to a real C:\\dev\\null a user can create: use an empty folder we own.
+            empty = self.path / LOCK_DIR / "no-hooks"
+            empty.mkdir(parents=True, exist_ok=True)
+            hooks = str(empty)
+        cmd += [
+            "-c",
+            f"core.hooksPath={hooks}",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.longpaths=true",
+        ]
         if identity:
             cmd += self._fallback_identity()
         cmd += list(args)
@@ -235,8 +249,10 @@ class GitRepo:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=_git_env(),
-            start_new_session=True,
+            **winfs.popen_group_kwargs(),
         )
         try:
             stdout, stderr = proc.communicate(timeout=self.git_timeout)
@@ -256,8 +272,7 @@ class GitRepo:
 
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
+        winfs.kill_tree(proc)
         try:
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:

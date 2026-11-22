@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
-from commons.core import filelock
+from commons.core import filelock, winfs
 from commons.core.fleet import Profile
 
 PROMPT_FIELDS = ("prompt",)
@@ -247,11 +247,7 @@ def job_keys(jobs: list) -> list[str]:
 
 
 def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    winfs.fsync_path(path)
 
 
 def write_atomic(path: Path, data: bytes) -> None:
@@ -268,7 +264,7 @@ def write_atomic(path: Path, data: bytes) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, mode)
-        os.replace(tmp, target)
+        winfs.replace_retry(tmp, target)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
@@ -322,7 +318,7 @@ def rewrite_backup_path(backup_dir: Path, finding: Finding) -> Path:
     if finding.kind == "cron":
         return Path(backup_dir) / REWRITES / "cron" / str(finding.profile) / JOBS_FILE
     assert finding.path is not None
-    return Path(backup_dir) / REWRITES / "files" / Path(finding.path).resolve().relative_to("/")
+    return Path(backup_dir) / REWRITES / "files" / winfs.relative_anchor(Path(finding.path).resolve())
 
 
 def _backup_once(src: Path, dest: Path) -> None:

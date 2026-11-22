@@ -46,7 +46,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from commons.core import filelock
+from commons.core import filelock, winfs
 from commons.core.fleet import Profile
 
 SETTINGS_FILE = "consistency.json"
@@ -196,8 +196,8 @@ def _same(a: Path, b: Path) -> bool:
 
 def link_state(profile: Profile) -> LinkState:
     path = hermes_locks(profile)
-    if path.is_symlink():
-        raw = Path(os.readlink(path))
+    if winfs.is_link(path):
+        raw = Path(winfs.read_link(path))
         target = raw if raw.is_absolute() else path.parent / raw
         return LinkState(profile.name, path, "link", target)
     if not path.exists():
@@ -227,7 +227,7 @@ def busy_locks(dirs: Iterable[Path]) -> list[Path]:
     for d in dirs:
         with contextlib.suppress(OSError):
             for entry in sorted(Path(d).iterdir()):
-                if not entry.is_file() or entry.is_symlink():
+                if not entry.is_file() or winfs.is_link(entry):
                     continue
                 try:
                     # Windows needs write access to take a byte lock; POSIX flock does not.
@@ -272,9 +272,12 @@ def _relink(path: Path, target: Path) -> None:
     """Point *path* (a symlink, or nothing) at *target* with one atomic rename."""
     tmp = path.with_name(f"{HERMES_LOCKS}.commons-new")
     with contextlib.suppress(FileNotFoundError):
-        if tmp.is_symlink():
-            tmp.unlink()  # our own leftover temp link from an interrupted switch, never a user file
-    os.symlink(target, tmp, target_is_directory=True)
+        if winfs.is_link(tmp):
+            winfs.remove_link(tmp)  # our own leftover temp link from an interrupted switch, never a user file
+    winfs.make_dir_link(tmp, target)
+    if winfs.IS_WINDOWS and winfs.is_link(path):
+        # os.replace cannot overwrite a directory link on Windows: drop the old link, then rename.
+        winfs.remove_link(path)
     os.replace(tmp, path)
 
 
@@ -332,13 +335,13 @@ def switch_locks(
         target.mkdir(parents=True, exist_ok=True)
         path = s.path
         for _attempt in range(SWITCH_RETRIES):
-            if path.is_symlink() or not os.path.lexists(path):
+            if winfs.is_link(path) or not os.path.lexists(path):
                 try:
                     _relink(path, target)
                 except IsADirectoryError:
                     continue  # Hermes recreated a real .locks in the gap: set it aside and retry
                 except OSError as exc:
-                    if not path.is_dir() or path.is_symlink():
+                    if not path.is_dir() or winfs.is_link(path):
                         raise ConsistencyError(f"could not link {path} to {target}: {exc}") from exc
                     continue
                 break
@@ -397,7 +400,7 @@ def undo_setup_lock(profiles: Iterable[Profile], state_dir: Path, now: datetime 
         raise ConsistencyError(f"a skill write is in progress (lock held: {held[0]}); try the restore again")
     done = []
     for s in ours:
-        os.unlink(s.path)  # commons' own symlink, never a user folder
+        winfs.remove_link(s.path)  # commons' own symlink, never a user folder
         original = saved / f"{s.profile}{HERMES_LOCKS}" if saved else None
         if original is not None and original.is_dir():
             shutil.move(str(original), str(s.path))
