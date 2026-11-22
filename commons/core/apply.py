@@ -75,7 +75,6 @@ import contextlib
 import copy
 import hashlib
 import json
-import os
 import shutil
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -417,8 +416,7 @@ class _RewriteHook:
         fresh = _next_free(write.backup)
         fresh.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(write.path, fresh)
-        with open(fresh, "rb") as fh:
-            os.fsync(fh.fileno())
+        winfs.fsync_path(fresh)
         _fsync_dir(fresh.parent)
         if file_sha256(fresh) != write.sha_before:
             raise ApplyError(f"{write.path} changed while it was being backed up; not rewritten")

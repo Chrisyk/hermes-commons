@@ -5,6 +5,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -256,6 +257,7 @@ def _gone(pid: int) -> bool:
     return stat_line.rsplit(")", 1)[1].split()[0] == "Z"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="fake git is a /bin/sh script")
 def test_hung_git_is_killed_and_its_index_lock_removed(repo, tmp_path):
     slow = GitRepo(repo.path, git_bin=str(_slow_git(tmp_path)), git_timeout=0.5)
     start = time.monotonic()
@@ -274,6 +276,7 @@ def test_hung_git_is_killed_and_its_index_lock_removed(repo, tmp_path):
     assert repo.commit_all("after timeout") is not None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="fake git is a /bin/sh script")
 def test_timeout_keeps_an_index_lock_that_was_already_there(repo, tmp_path):
     lock = repo.path / ".git" / "index.lock"
     lock.write_text("someone else\n", encoding="utf-8")
@@ -283,6 +286,7 @@ def test_timeout_keeps_an_index_lock_that_was_already_there(repo, tmp_path):
     assert lock.read_text(encoding="utf-8") == "someone else\n"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="fake git is a /bin/sh script")
 def test_unlocked_read_timeout_never_removes_index_lock(repo, tmp_path):
     # status runs without the repo lock, so an index.lock that appears meanwhile
     # may belong to a concurrent locked writer and must be left alone.

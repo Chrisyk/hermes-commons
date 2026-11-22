@@ -137,9 +137,9 @@ def _copy_then_remove(src: Path, dest: Path) -> None:
         raise FileExistsError(f"staging path {staging} already exists")
     try:
         if src.is_symlink():
-            staging.symlink_to(os.readlink(src))
+            staging.symlink_to(winfs.read_link(src))
             _fsync_path(dest.parent)
-            ok = os.readlink(staging) == os.readlink(src)
+            ok = winfs.read_link(staging) == winfs.read_link(src)
         elif src.is_dir():
             shutil.copytree(src, staging, symlinks=True)
             _fsync_tree(staging)

@@ -222,10 +222,8 @@ class GitRepo:
             cmd.append("--no-optional-locks")
         hooks = "/dev/null"
         if winfs.IS_WINDOWS:
-            # /dev/null may resolve to a real C:\\dev\\null a user can create: use an empty folder we own.
-            empty = self.path / LOCK_DIR / "no-hooks"
-            empty.mkdir(parents=True, exist_ok=True)
-            hooks = str(empty)
+            # /dev/null may resolve to a real C:\\dev\\null a user can create: use a folder that never exists.
+            hooks = str(self.path / LOCK_DIR / "no-hooks")  # never created: git runs no hooks from a missing folder
         cmd += [
             "-c",
             f"core.hooksPath={hooks}",

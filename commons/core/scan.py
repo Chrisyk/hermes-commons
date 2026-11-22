@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from commons.core import winfs
 from commons.core.fleet import Profile
 
 SKILL_FILE = "SKILL.md"
@@ -152,7 +153,7 @@ def _tree_hash(directory: Path) -> tuple[str, str | None, bool]:
     for rel, kind, full in sorted(entries):
         try:
             if kind == "L":
-                target = os.readlink(full).encode("utf-8", "surrogateescape")
+                target = winfs.read_link(full).encode("utf-8", "surrogateescape")
                 h.update(_rel_bytes(rel) + b"\0L" + str(len(target)).encode() + b"\0" + target)
             else:
                 _hash_file(h, rel, full)

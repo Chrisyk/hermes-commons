@@ -327,8 +327,7 @@ def _backup_once(src: Path, dest: Path) -> None:
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
-    with open(dest, "rb") as fh:
-        os.fsync(fh.fileno())
+    winfs.fsync_path(dest)
     _fsync_dir(dest.parent)
 
 

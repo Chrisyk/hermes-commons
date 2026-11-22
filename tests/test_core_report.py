@@ -1,3 +1,5 @@
+import sys
+
 """Tests for commons.core.report status report."""
 
 import json
@@ -234,6 +236,7 @@ def _lines(profile, platform=None):
     return index_lines(index, profile.config, platform=platform, environ={})
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the fixture expects a Linux host")
 def test_index_filters_host_and_config(tmp_path):
     profile, _, _ = _index_fixture(tmp_path)
     lines = _lines(profile)

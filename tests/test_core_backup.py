@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -63,6 +64,7 @@ def test_symlink_target_contents_not_copied(classic_fleet, tmp_path):
     assert all(any(parent.is_symlink() for parent in p.parents) for p in copied)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec bits and modes do not exist on Windows")
 def test_tree_hash_sensitive_to_content_link_and_exec_bit(tmp_path):
     tree = tmp_path / "t"
     (tree / "a").mkdir(parents=True)

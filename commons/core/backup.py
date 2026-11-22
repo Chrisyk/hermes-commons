@@ -78,7 +78,7 @@ def tree_sha256(root: Path) -> str | None:
         st = p.lstat()
         h.update(os.fsencode(rel) + b"\x00")
         if stat.S_ISLNK(st.st_mode):
-            h.update(b"l\x00" + os.fsencode(os.readlink(p)) + b"\x00")
+            h.update(b"l\x00" + os.fsencode(winfs.read_link(p)) + b"\x00")
         elif stat.S_ISDIR(st.st_mode):
             h.update(b"d\x00")
         elif stat.S_ISREG(st.st_mode):
@@ -151,7 +151,7 @@ def copy_tree(src: Path, dst: Path) -> None:
         target = dst / rel
         st = p.lstat()
         if stat.S_ISLNK(st.st_mode):
-            target.symlink_to(os.readlink(p))
+            target.symlink_to(winfs.read_link(p))
         elif stat.S_ISDIR(st.st_mode):
             target.mkdir()
             dirs.append(target)
@@ -191,7 +191,7 @@ def path_sha256(path: Path) -> str | None:
     """tree_sha256 of a folder, file_sha256 of a file, 'link:<target>' of a symlink; None if absent."""
     path = Path(path)
     if path.is_symlink():
-        return "link:" + os.readlink(path)
+        return "link:" + winfs.read_link(path)
     if path.is_dir():
         return tree_sha256(path)
     return file_sha256(path)
@@ -209,7 +209,7 @@ def write_json_atomic(path: Path, data: dict) -> None:
 
 
 def _link_target(path: Path) -> str | None:
-    return os.readlink(path) if path.is_symlink() else None
+    return winfs.read_link(path) if path.is_symlink() else None
 
 
 def create_backup(where: Backups, profiles: list[Profile], label: str, now: datetime | None = None) -> str:

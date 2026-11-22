@@ -281,7 +281,7 @@ def _mtimes(path: Path) -> dict[str, int]:
             for entry in entries:
                 with contextlib.suppress(OSError):
                     if entry.is_dir():
-                        out[entry.name] = entry.stat().st_mtime_ns
+                        out[entry.name] = os.stat(entry.path).st_mtime_ns
     return out
 
 

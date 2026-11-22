@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -193,6 +194,7 @@ def test_retire_plain_file(tmp_path):
     assert not src.exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 def test_cross_filesystem_plain_file(tmp_path, monkeypatch):
     src = tmp_path / "skills" / "run.sh"
     src.parent.mkdir()

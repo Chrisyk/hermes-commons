@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -29,6 +30,7 @@ class Runner:
         return subprocess.CompletedProcess(argv, self.returncode, stdout="", stderr=self.stderr)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="covers the POSIX .sh script; Windows writes a .py script")
 def test_script_text_and_mode(tmp_path):
     path = cli.write_check_script(tmp_path, fake_command(["commons", "check", "--fix-safe", "--quiet"]))
     assert path == tmp_path / "scripts" / "commons-check.sh"
@@ -38,11 +40,13 @@ def test_script_text_and_mode(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o755
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="covers the POSIX .sh script; Windows writes a .py script")
 def test_script_quotes_a_launcher_path_with_spaces(tmp_path):
     path = cli.write_check_script(tmp_path, ["/my apps/hermes", "commons", "check"])
     assert path.read_text(encoding="utf-8").splitlines()[1] == "exec '/my apps/hermes' commons check"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="covers the POSIX .sh script; Windows writes a .py script")
 def test_cron_create_command_line(tmp_path):
     runner = Runner()
     msg = cli.schedule_check(tmp_path, command=fake_command, runner=runner)

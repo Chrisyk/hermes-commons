@@ -1,3 +1,5 @@
+import sys
+
 """Tests for commons.core.group grouping and containment."""
 
 import os
@@ -468,6 +470,7 @@ def test_empty_runtime_cache_dir_is_ignored(fleet):
     assert _groups(root)["x"].status == "identical"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec bits and modes do not exist on Windows")
 def test_undecodable_filename_in_own_copies(fleet):
     bad = os.fsdecode(b"bad\xff.txt")
     root, _ = _pair(fleet, {"SKILL.md": _MD}, {"SKILL.md": _MD})
@@ -476,6 +479,7 @@ def test_undecodable_filename_in_own_copies(fleet):
     assert _groups(root)["x"].status == "identical"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec bits and modes do not exist on Windows")
 def test_executable_bit_only_in_smaller_copy_is_conflict(fleet):
     a = {"SKILL.md": _MD, "scripts/run.sh": "echo run\n"}
     b = {"SKILL.md": _MD_PLUS, "scripts/run.sh": "echo run\n"}
@@ -484,6 +488,7 @@ def test_executable_bit_only_in_smaller_copy_is_conflict(fleet):
     assert _groups(root)["x"].status == "conflict"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec bits and modes do not exist on Windows")
 def test_executable_bit_difference_breaks_identical(fleet):
     files = {"SKILL.md": _MD, "scripts/run.sh": "echo run\n"}
     root, g = _pair(fleet, dict(files), dict(files))
@@ -590,6 +595,7 @@ def test_excluded_dir_difference_in_one_profile_is_dup(fleet):
     assert _groups(root)["x"].status == "in-profile-dup"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec bits and modes do not exist on Windows")
 def test_fingerprint_and_same_content(tmp_path):
     a, b = tmp_path / "a", tmp_path / "b"
     write_files(a, {"SKILL.md": _MD, "n.txt": "x\n"})
@@ -611,6 +617,7 @@ def test_compare_variants(classic_fleet):
 # ------------------------------------------------------------------ executable bits only
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec bits and modes do not exist on Windows")
 def test_exec_bit_superset_contains_the_other(fleet):
     files = {"SKILL.md": _MD, "scripts/run.sh": "echo run\n", "scripts/b.sh": "echo b\n"}
     root, _ = _pair(fleet, dict(files), dict(files))
@@ -626,6 +633,7 @@ def test_exec_bit_superset_contains_the_other(fleet):
     assert g.status == "contained" and g.keep.profile == "device"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec bits and modes do not exist on Windows")
 def test_exec_bits_neither_superset_is_conflict(fleet):
     files = {"SKILL.md": _MD, "scripts/a.sh": "echo a\n", "scripts/b.sh": "echo b\n"}
     root, _ = _pair(fleet, dict(files), dict(files))
@@ -634,6 +642,7 @@ def test_exec_bits_neither_superset_is_conflict(fleet):
     assert _groups(root)["x"].status == "conflict"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec bits and modes do not exist on Windows")
 def test_exec_bit_rule_needs_equal_content(fleet):
     a = {"SKILL.md": _MD, "scripts/run.sh": "echo run\n"}
     b = {"SKILL.md": _MD, "scripts/run.sh": "echo run\necho more\n"}
