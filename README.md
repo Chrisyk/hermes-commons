@@ -134,6 +134,18 @@ hermes commons setup --apply
 hermes commons check
 ```
 
+Without `--root`, setup adopts the `skills.create_dir` that most profiles already use. If that
+is not the folder you want (for example, it points into another project or a notes vault), pick
+the shared root yourself and read the proposal before applying it:
+
+```
+hermes commons setup --root ~/.hermes/shared-skills
+```
+
+Back up your skills first. To see where skills resolve from, run `hermes commons status`
+(`--skill NAME` for one skill). Every command has `--help`, for example
+`hermes commons setup --help`; if a flag is missing there, update the plugin.
+
 Enable the plugin in each profile that should get per-edit commits (setup proposes this).
 Setup can also add an hourly `hermes commons check --fix-safe --quiet` cron job
 (`setup --apply --schedule`).
